@@ -17,9 +17,13 @@ async fn main() -> Result<()> {
         mu:    b"miner-pubkey-placeholder".to_vec(),
     });
 
-    // Try GPU devices 0–3; workers that fail to init exit silently
-    let device_ids: Vec<u32> = (0u32..4).collect();
-    eprintln!("[init] starting pipeline (up to {} GPU device(s))", device_ids.len());
+    let n_devices = pearl_gpu::device_count();
+    if n_devices == 0 {
+        eprintln!("[init] no CUDA devices found — exiting");
+        return Ok(());
+    }
+    let device_ids: Vec<u32> = (0..n_devices as u32).collect();
+    eprintln!("[init] detected {} CUDA device(s): {:?}", n_devices, device_ids);
 
     let (_pipeline, handle, mut blocks) =
         MiningPipeline::start(Arc::clone(&config), &device_ids);

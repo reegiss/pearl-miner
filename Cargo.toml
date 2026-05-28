@@ -27,3 +27,5 @@ pearl-block      = { path = "crates/pearl-block" }
 pearl-gpu        = { path = "crates/pearl-gpu" }
 tokio  = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 anyhow = "1"
+clap   = { version = "4", features = ["derive"] }
+bech32 = "0.11"

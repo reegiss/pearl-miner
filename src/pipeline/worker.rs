@@ -140,7 +140,6 @@ where
         let fl          = job.fl.clone();
         let fr          = job.fr.clone();
         let a_in        = Arc::clone(&job.a);
-        let b_in        = Arc::clone(&job.b);
         let commitments = Arc::clone(&job.commitments);
         let config      = Arc::clone(&job.config);
         let params      = config.params.clone();
@@ -271,5 +270,112 @@ mod tests {
             .expect("expected Some(PreparedJob)");
         assert_eq!(prepared.a_noisy.len(), 4 * 64);
         assert_eq!(prepared.b_noisy.len(), 64 * 4);
+    }
+
+    use crate::pipeline::{PipelineError, PreparedJob};
+    use std::sync::Mutex;
+
+    fn make_prepared_job(
+        config: Arc<MiningConfig>,
+        result_tx: tokio::sync::oneshot::Sender<Result<Vec<i32>, PipelineError>>,
+    ) -> Arc<PreparedJob> {
+        let (m, k, n, r) = (4usize, 64usize, 4usize, 32usize);
+        let a: Arc<[i8]> = vec![1i8; m * k].into();
+        let b: Arc<[i8]> = vec![2i8; k * n].into();
+        Arc::new(PreparedJob {
+            a:       Arc::clone(&a),
+            b:       Arc::clone(&b),
+            a_noisy: a.to_vec(),
+            b_noisy: b.to_vec(),
+            el: vec![0i8; m * r],
+            er: vec![0i8; r * k],
+            fl: vec![0i8; k * r],
+            fr: vec![0i8; r * n],
+            commitments: dummy_commitments(),
+            config,
+            result_tx: Arc::new(Mutex::new(Some(result_tx))),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_worker_delivers_clean_product() {
+        let config = dummy_config();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let job = make_prepared_job(Arc::clone(&config), result_tx);
+
+        let (prepared_tx, prepared_rx) = watch::channel(None::<Arc<PreparedJob>>);
+        let (block_tx, _block_rx) = mpsc::channel(8);
+
+        let mock_mine = move |_a: &[i8], _b: &[i8], _c: &Commitments, cfg: &MiningConfig| {
+            let sz = (cfg.params.m * cfg.params.n) as usize;
+            Ok::<(Vec<FoundTile>, Vec<i32>), anyhow::Error>((vec![], vec![42i32; sz]))
+        };
+
+        tokio::spawn(gpu_worker_loop(prepared_rx, block_tx, mock_mine));
+        prepared_tx.send_replace(Some(job));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            result_rx,
+        ).await.expect("timed out").unwrap();
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 4 * 4);
+    }
+
+    #[tokio::test]
+    async fn test_worker_emits_block_when_tile_found() {
+        let config = dummy_config();
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        let job = make_prepared_job(Arc::clone(&config), result_tx);
+
+        let (prepared_tx, prepared_rx) = watch::channel(None::<Arc<PreparedJob>>);
+        let (block_tx, mut block_rx) = mpsc::channel(8);
+
+        let mock_mine = move |_a: &[i8], _b: &[i8], _c: &Commitments, cfg: &MiningConfig| {
+            let tile = FoundTile {
+                tile_i: 0, tile_j: 0,
+                m_state: [1i32; 16],
+                final_hash: [0u8; 32],
+            };
+            let sz = (cfg.params.m * cfg.params.n) as usize;
+            Ok::<(Vec<FoundTile>, Vec<i32>), anyhow::Error>((vec![tile], vec![0i32; sz]))
+        };
+
+        tokio::spawn(gpu_worker_loop(prepared_rx, block_tx, mock_mine));
+        prepared_tx.send_replace(Some(job));
+
+        let block = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            block_rx.recv(),
+        ).await.expect("timed out").expect("channel closed");
+        assert_eq!(block.certificate.tile.tile_i, 0);
+    }
+
+    #[tokio::test]
+    async fn test_two_workers_only_one_delivers_result() {
+        let config = dummy_config();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let job = make_prepared_job(Arc::clone(&config), result_tx);
+
+        let (prepared_tx, prepared_rx1) = watch::channel(None::<Arc<PreparedJob>>);
+        let prepared_rx2 = prepared_tx.subscribe();
+        let (block_tx1, _) = mpsc::channel(8);
+        let (block_tx2, _) = mpsc::channel(8);
+
+        let mock_mine = move |_a: &[i8], _b: &[i8], _c: &Commitments, cfg: &MiningConfig| {
+            let sz = (cfg.params.m * cfg.params.n) as usize;
+            Ok::<(Vec<FoundTile>, Vec<i32>), anyhow::Error>((vec![], vec![0i32; sz]))
+        };
+
+        tokio::spawn(gpu_worker_loop(prepared_rx1, block_tx1, mock_mine));
+        tokio::spawn(gpu_worker_loop(prepared_rx2, block_tx2, mock_mine));
+        prepared_tx.send_replace(Some(job));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            result_rx,
+        ).await.expect("timed out").unwrap();
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
     }
 }

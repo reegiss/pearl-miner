@@ -1,0 +1,10 @@
+[package]
+name = "pearl-peel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pearl-types = { path = "../pearl-types" }
+
+[dev-dependencies]
+pearl-noise = { path = "../pearl-noise" }

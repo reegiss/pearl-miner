@@ -1,0 +1,8 @@
+[package]
+name = "pearl-noise"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pearl-types = { path = "../pearl-types" }
+blake3 = "1"

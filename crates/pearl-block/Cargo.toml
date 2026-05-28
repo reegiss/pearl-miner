@@ -1,0 +1,11 @@
+[package]
+name = "pearl-block"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pearl-types = { path = "../pearl-types" }
+blake3 = "1"
+sha2 = "0.10"
+num-bigint = "0.4"
+num-traits = "0.2"

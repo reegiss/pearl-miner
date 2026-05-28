@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/pearl-types",
+    "crates/pearl-commitment",
+    "crates/pearl-noise",
+    "crates/pearl-peel",
+    "crates/pearl-block",
+]
+resolver = "2"

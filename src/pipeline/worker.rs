@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use anyhow::Result;
+use tokio::sync::{mpsc, watch};
 use pearl_block::PearlBlock;
 use pearl_commitment::MerkleTree;
 use pearl_types::{BlockCertificate, Commitments, FoundTile, MiningConfig};
@@ -52,10 +55,142 @@ pub fn assemble_block(
     }
 }
 
+pub async fn preprocessor_loop(
+    raw_slot:    Arc<crate::pipeline::slot::LastSlot<crate::pipeline::RawJob>>,
+    prepared_tx: watch::Sender<Option<Arc<crate::pipeline::PreparedJob>>>,
+) {
+    use crate::pipeline::PreparedJob;
+    use std::sync::Mutex;
+
+    loop {
+        if prepared_tx.receiver_count() == 0 {
+            break; // all GPU workers have exited
+        }
+
+        let job = raw_slot.take().await;
+
+        let a   = Arc::clone(&job.a);
+        let b   = Arc::clone(&job.b);
+        let cfg = Arc::clone(&job.config);
+        let result_tx_raw = job.result_tx;
+
+        let preprocess_result = tokio::task::spawn_blocking(move || {
+            let p = &cfg.params;
+            let (m, n, k, r) = (p.m as usize, p.n as usize, p.k as usize, p.r as usize);
+            let commitments  = pearl_commitment::compute(&a, &b, &cfg);
+            let (el, er)     = pearl_noise::generate_e(p.m, p.k, p.r, &commitments.s_a);
+            let (fl, fr)     = pearl_noise::generate_f(p.k, p.n, p.r, &commitments.s_b);
+            let a_noisy      = apply_noise(&a, &el, &er, m, k, r);
+            let b_noisy      = apply_noise(&b, &fl, &fr, k, n, r);
+            PreparedJob {
+                a:           Arc::clone(&a),
+                b:           Arc::clone(&b),
+                a_noisy,
+                b_noisy,
+                el, er, fl, fr,
+                commitments: Arc::new(commitments),
+                config:      cfg,
+                result_tx:   Arc::new(Mutex::new(Some(result_tx_raw))),
+            }
+        }).await;
+
+        match preprocess_result {
+            Ok(prepared) => {
+                let _ = prepared_tx.send_replace(Some(Arc::new(prepared)));
+            }
+            Err(_panic) => {
+                // result_tx_raw moved into spawn_blocking and dropped on panic;
+                // oneshot closes → caller gets WorkerPanic via map_err
+            }
+        }
+    }
+}
+
+pub async fn gpu_worker_loop<F>(
+    mut prepared_rx: watch::Receiver<Option<Arc<crate::pipeline::PreparedJob>>>,
+    block_tx: mpsc::Sender<PearlBlock>,
+    mine_fn: F,
+)
+where
+    F: FnMut(&[i8], &[i8], &Commitments, &MiningConfig)
+         -> Result<(Vec<FoundTile>, Vec<i32>)>
+         + Send + 'static,
+{
+    use crate::pipeline::PipelineError;
+    let mine_fn = Arc::new(std::sync::Mutex::new(mine_fn));
+
+    loop {
+        if prepared_rx.changed().await.is_err() {
+            break; // sender dropped — pipeline shut down
+        }
+
+        let job = {
+            let borrow = prepared_rx.borrow_and_update();
+            match borrow.as_ref() {
+                Some(j) => Arc::clone(j),
+                None    => continue,
+            }
+        };
+
+        // Clone everything needed inside spawn_blocking
+        let a_noisy     = job.a_noisy.clone();
+        let b_noisy     = job.b_noisy.clone();
+        let el          = job.el.clone();
+        let er          = job.er.clone();
+        let fl          = job.fl.clone();
+        let fr          = job.fr.clone();
+        let a_in        = Arc::clone(&job.a);
+        let b_in        = Arc::clone(&job.b);
+        let commitments = Arc::clone(&job.commitments);
+        let config      = Arc::clone(&job.config);
+        let params      = config.params.clone();
+        let mine_fn2    = Arc::clone(&mine_fn);
+        // Keep clones in async context for assemble_block after spawn_blocking
+        let a_for_block   = Arc::clone(&job.a);
+        let b_for_block   = Arc::clone(&job.b);
+        let comm_for_block = Arc::clone(&job.commitments);
+        let cfg_for_block  = Arc::clone(&job.config);
+        let result_tx     = Arc::clone(&job.result_tx);
+
+        let mine_result = tokio::task::spawn_blocking(move || {
+            let mut f = mine_fn2.lock().unwrap();
+            let (found_tiles, ab_noisy) = f(&a_noisy, &b_noisy, &commitments, &config)?;
+            let clean_ab = pearl_peel::recover(
+                &ab_noisy, &a_in, &b_noisy,
+                &el, &er, &fl, &fr, &params,
+            );
+            Ok::<(Vec<FoundTile>, Vec<i32>), anyhow::Error>((found_tiles, clean_ab))
+        }).await;
+
+        match mine_result {
+            Ok(Ok((found_tiles, clean_ab))) => {
+                // First worker to take result_tx wins; others see None and skip
+                if let Some(tx) = result_tx.lock().unwrap().take() {
+                    let _ = tx.send(Ok(clean_ab));
+                }
+                // Send blocks in async context (cannot .await inside spawn_blocking)
+                for tile in &found_tiles {
+                    let block = assemble_block(
+                        tile, &a_for_block, &b_for_block,
+                        &comm_for_block, &cfg_for_block,
+                    );
+                    let _ = block_tx.send(block).await;
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                if let Some(tx) = result_tx.lock().unwrap().take() {
+                    let _ = tx.send(Err(PipelineError::WorkerPanic));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use tokio::sync::watch;
     use pearl_types::{Commitments, FoundTile, MatrixParams, MiningConfig};
 
     pub fn dummy_config() -> Arc<MiningConfig> {
@@ -103,5 +238,38 @@ mod tests {
         assert_eq!(block.certificate.commitments, *commitments);
         assert!(!block.certificate.merkle_proof_a.is_empty());
         assert!(!block.certificate.merkle_proof_b.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_preprocessor_dispatches_prepared_job() {
+        use crate::pipeline::slot::LastSlot;
+        use crate::pipeline::RawJob;
+
+        let config = dummy_config();
+        let raw_slot = Arc::new(LastSlot::<RawJob>::new());
+        let (prepared_tx, mut prepared_rx) =
+            watch::channel(None::<Arc<crate::pipeline::PreparedJob>>);
+
+        let slot2 = Arc::clone(&raw_slot);
+        tokio::spawn(preprocessor_loop(slot2, prepared_tx));
+
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        let job = RawJob {
+            a:         vec![1i8; 4 * 64].into(),
+            b:         vec![2i8; 64 * 4].into(),
+            config:    Arc::clone(&config),
+            result_tx,
+        };
+        raw_slot.put(job);
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            prepared_rx.changed(),
+        ).await.expect("preprocessor timed out").unwrap();
+
+        let prepared = prepared_rx.borrow().clone()
+            .expect("expected Some(PreparedJob)");
+        assert_eq!(prepared.a_noisy.len(), 4 * 64);
+        assert_eq!(prepared.b_noisy.len(), 64 * 4);
     }
 }

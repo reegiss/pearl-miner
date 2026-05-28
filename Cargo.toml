@@ -25,7 +25,8 @@ pearl-noise      = { path = "crates/pearl-noise" }
 pearl-peel       = { path = "crates/pearl-peel" }
 pearl-block      = { path = "crates/pearl-block" }
 pearl-gpu        = { path = "crates/pearl-gpu" }
-tokio  = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio  = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+serde_json = "1"
 anyhow = "1"
 clap   = { version = "4", features = ["derive"] }
 bech32 = "0.11"

@@ -22,15 +22,15 @@ All orchestration lives in `src/pipeline.rs` (not a new crate) because it wires 
 
 ## 2. Architecture
 
-Three concurrent actors communicate through two Tokio `watch` channels:
+Two concurrent actors communicate via a custom `LastSlot` (for the raw job) and a Tokio `watch` channel (for the prepared job):
 
 ```
 submit(a, b)
     │
     ▼
-[raw_watch]  ← watch::Sender<Option<Arc<RawJob>>>
-    │             drop-oldest: submit() swaps in new job,
-    │             signals Err(Dropped) to any displaced caller immediately
+[LastSlot<RawJob>]   — custom single-slot queue (Mutex<Option<RawJob>> + Notify)
+    │                  put() returns displaced job (if any) → Err(Dropped) sent inline
+    │                  take() blocks until a job is available
     ▼
 Preprocessor task  (1×, spawn_blocking for CPU work)
     • pearl_commitment::compute()
@@ -51,10 +51,8 @@ First GPU to finish:
 
 ### Drop-Oldest Semantics
 
-Drop-oldest is provided by `watch::Sender::send_replace()`:
-
-- **Raw level:** if `submit()` is called while the preprocessor is idle, `send_replace` returns the old `RawJob`; `submit()` immediately sends `Err(Dropped)` on the displaced caller's `result_tx`. If the preprocessor already took the job, `send_replace` returns `None` — the old job is in-flight and will complete normally.
-- **Prepared level:** if a second `PreparedJob` arrives before GPUs pick up the first, it silently overwrites it (the stale prepared job had not been started, so no caller is waiting on it).
+- **Raw level:** `LastSlot::put()` swaps in the new `RawJob` and returns the displaced one (if any). `submit()` immediately sends `Err(Dropped)` on its `result_tx`. If the preprocessor already took the job via `take()`, `put()` returns `None` — the in-flight job completes normally.
+- **Prepared level:** `watch::Sender::send_replace()` overwrites the slot; if GPUs haven't yet picked up the previous `PreparedJob`, it is silently discarded (no caller is waiting on it, since its `result_tx` belongs to a job already in-flight through the preprocessor).
 
 ---
 
@@ -74,8 +72,8 @@ pub enum PipelineError {
 /// Clone-able handle; multiple threads may call submit() concurrently.
 #[derive(Clone)]
 pub struct PipelineHandle {
-    raw_tx:  watch::Sender<Option<Arc<RawJob>>>,
-    block_rx: Arc<Mutex<mpsc::Receiver<PearlBlock>>>,  // shared across clones
+    raw_slot: Arc<LastSlot<RawJob>>,   // Arc makes it Clone; LastSlot owns the Mutex
+    config:   Arc<MiningConfig>,
 }
 
 impl PipelineHandle {
@@ -87,8 +85,16 @@ impl PipelineHandle {
         b: Arc<[i8]>,
     ) -> Result<Vec<i32>, PipelineError>;
 
-    /// Receive the next found block. Returns None when the pipeline shuts down.
-    pub async fn next_block(&self) -> Option<PearlBlock>;
+}
+
+/// Receives found blocks. Not Clone — only one consumer expected.
+pub struct BlockReceiver {
+    rx: mpsc::Receiver<PearlBlock>,
+}
+
+impl BlockReceiver {
+    /// Returns None when the pipeline shuts down.
+    pub async fn next(&mut self) -> Option<PearlBlock>;
 }
 
 /// Owns all worker JoinHandles. Drop to shut down.
@@ -98,11 +104,10 @@ pub struct MiningPipeline {
 
 impl MiningPipeline {
     /// Spawns preprocessor + one GPU worker per device_id.
-    /// Returns (pipeline_owner, shareable_handle).
     pub fn start(
         config: Arc<MiningConfig>,
         device_ids: &[u32],
-    ) -> (MiningPipeline, PipelineHandle);
+    ) -> (MiningPipeline, PipelineHandle, BlockReceiver);
 }
 ```
 
@@ -113,6 +118,20 @@ impl MiningPipeline {
 ## 4. Internal Types
 
 ```rust
+/// Single-slot last-write-wins queue. Not a watch channel because RawJob
+/// contains oneshot::Sender which is !Clone.
+struct LastSlot<T> {
+    inner:  Mutex<Option<T>>,
+    notify: Notify,
+}
+
+impl<T: Send> LastSlot<T> {
+    /// Swap in val; return displaced predecessor (if any).
+    fn put(&self, val: T) -> Option<T>;
+    /// Block until a value is available, then take it.
+    async fn take(&self) -> T;
+}
+
 /// Lives from submit() until preprocessing begins (or until Dropped).
 struct RawJob {
     a:         Arc<[i8]>,
@@ -148,15 +167,11 @@ struct PreparedJob {
 ```rust
 pub async fn submit(&self, a: Arc<[i8]>, b: Arc<[i8]>) -> Result<Vec<i32>, PipelineError> {
     let (result_tx, result_rx) = oneshot::channel();
-    let new_job = Arc::new(RawJob { a, b, config: self.config.clone(), result_tx });
+    let new_job = RawJob { a, b, config: Arc::clone(&self.config), result_tx };
 
-    // Swap in new job; get back any displaced predecessor
-    let old = self.raw_tx.send_replace(Some(Arc::clone(&new_job)));
-    if let Some(displaced) = old.flatten() {
-        // Arc::try_unwrap succeeds only if preprocessor hasn't taken it yet
-        if let Ok(job) = Arc::try_unwrap(displaced) {
-            let _ = job.result_tx.send(Err(PipelineError::Dropped));
-        }
+    // Swap in new job; immediately signal any displaced predecessor
+    if let Some(displaced) = self.raw_slot.put(new_job) {
+        let _ = displaced.result_tx.send(Err(PipelineError::Dropped));
     }
 
     result_rx.await.map_err(|_| PipelineError::WorkerPanic)?
@@ -167,8 +182,7 @@ pub async fn submit(&self, a: Arc<[i8]>, b: Arc<[i8]>) -> Result<Vec<i32>, Pipel
 
 ```
 loop:
-  raw_rx.changed().await
-  let Some(job) = raw_rx.borrow_and_update().clone() else { continue }
+  let job = raw_slot.take().await    // blocks until submit() puts a job
 
   let result = spawn_blocking(move || {
       let commitments = pearl_commitment::compute(&job.a, &job.b, &job.config);
@@ -181,7 +195,11 @@ loop:
 
   match result {
       Ok(prepared) => { prepared_tx.send_replace(Some(Arc::new(prepared))); }
-      Err(_panic)  => { /* take result_tx and send WorkerPanic */ }
+      Err(_panic)  => {
+          let _ = job.result_tx.send(Err(PipelineError::WorkerPanic));
+          // Note: job was moved into spawn_blocking; on panic the sender is dropped,
+          // which closes the oneshot and causes result_rx.await to return Err → WorkerPanic
+      }
   }
 ```
 
@@ -247,7 +265,7 @@ src/
 └── pipeline.rs     — MiningPipeline, PipelineHandle, RawJob, PreparedJob, worker tasks
 ```
 
-`main.rs` is reduced to configuration, GPU device enumeration, and the top-level `run()` loop that submits synthetic (or real) matrices and prints found blocks.
+`main.rs` is reduced to configuration, GPU device enumeration, and the top-level `run()` loop that submits synthetic (or real) matrices and prints found blocks via `BlockReceiver::next()`.
 
 ---
 

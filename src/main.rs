@@ -1,4 +1,5 @@
 mod pipeline;
+mod args;
 
 use std::sync::Arc;
 use anyhow::Result;

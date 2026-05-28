@@ -5,5 +5,25 @@ members = [
     "crates/pearl-noise",
     "crates/pearl-peel",
     "crates/pearl-block",
+    "crates/pearl-gpu",
 ]
 resolver = "2"
+
+[package]
+name = "pearl-miner"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pearl-miner"
+path = "src/main.rs"
+
+[dependencies]
+pearl-types      = { path = "crates/pearl-types" }
+pearl-commitment = { path = "crates/pearl-commitment" }
+pearl-noise      = { path = "crates/pearl-noise" }
+pearl-peel       = { path = "crates/pearl-peel" }
+pearl-block      = { path = "crates/pearl-block" }
+pearl-gpu        = { path = "crates/pearl-gpu" }
+tokio  = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+anyhow = "1"

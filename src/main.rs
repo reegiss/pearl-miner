@@ -1,5 +1,6 @@
 mod pipeline;
 mod args;
+mod pool;
 
 use std::sync::Arc;
 use anyhow::Result;

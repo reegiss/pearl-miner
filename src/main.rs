@@ -8,6 +8,17 @@ use clap::Parser;
 use pearl_types::{MatrixParams, MiningConfig};
 use pipeline::{MiningPipeline, PipelineError};
 use args::Args;
+use pool::{pool_task, PoolChallenge};
+use tokio::sync::mpsc;
+
+fn make_config(challenge: &PoolChallenge, mu: &[u8]) -> Arc<MiningConfig> {
+    Arc::new(MiningConfig {
+        params: MatrixParams { m: 32, n: 32, k: 512, r: 32, tm: 4, tn: 4 },
+        difficulty_bits: challenge.difficulty,
+        sigma: challenge.seed.to_vec(),
+        mu: mu.to_vec(),
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,52 +40,71 @@ async fn main() -> Result<()> {
     let device_ids: Vec<u32> = (0..n_devices as u32).collect();
     eprintln!("[init] detected {} CUDA device(s): {:?}", n_devices, device_ids);
 
-    let config = Arc::new(MiningConfig {
-        params: MatrixParams {
-            m: 32, n: 32, k: 512, r: 32,
-            tm: 4,  tn: 4,
-        },
-        difficulty_bits: 1.0,
-        sigma: b"pearl-genesis-block".to_vec(),
-        mu,
-    });
+    // Pool channels
+    let (challenge_tx, mut challenge_rx) = tokio::sync::watch::channel(None::<PoolChallenge>);
+    let (block_tx, block_rx)             = mpsc::channel::<pearl_block::PearlBlock>(32);
 
-    let (_pipeline, handle, mut blocks) =
-        MiningPipeline::start(Arc::clone(&config), &device_ids);
+    tokio::spawn(pool_task(
+        args.pool.clone(),
+        args.wallet.clone(),
+        challenge_tx,
+        block_rx,
+    ));
 
-    tokio::spawn(async move {
-        while let Some(block) = blocks.next().await {
-            let id    = pearl_block::block_identity(&block);
-            let bytes = pearl_block::serialize(&block);
-            eprintln!("[block] found! identity={}  size={} bytes", hex(&id), bytes.len());
-        }
-        eprintln!("[block] block receiver closed");
-    });
+    // Wait for the first challenge before starting the pipeline
+    eprintln!("[pool] waiting for first challenge...");
+    challenge_rx.changed().await
+        .map_err(|_| anyhow::anyhow!("pool task exited before first challenge"))?;
+    let first = challenge_rx.borrow().clone().unwrap();
+    eprintln!("[pool] first challenge — seed={} difficulty={}",
+        hex(&first.seed), first.difficulty);
 
-    let p = &config.params;
+    // Synthetic matrices (in production these come from the AI workload)
+    let p = MatrixParams { m: 32, n: 32, k: 512, r: 32, tm: 4, tn: 4 };
     let (m, n, k) = (p.m as usize, p.n as usize, p.k as usize);
     let a: Arc<[i8]> = (0..m * k)
         .map(|i| ((i * 7 + 3) % 128) as i8 - 64)
-        .collect::<Vec<_>>()
-        .into();
+        .collect::<Vec<_>>().into();
     let b: Arc<[i8]> = (0..k * n)
         .map(|i| ((i * 11 + 5) % 128) as i8 - 64)
-        .collect::<Vec<_>>()
-        .into();
+        .collect::<Vec<_>>().into();
     eprintln!("[data] generated {}×{} A and {}×{} B (INT8)", m, k, k, n);
 
+    let config = make_config(&first, &mu);
+    let (mut pipeline, mut handle, mut blocks) =
+        MiningPipeline::start(Arc::clone(&config), &device_ids);
+
     loop {
-        match handle.submit(Arc::clone(&a), Arc::clone(&b)).await {
-            Ok(clean_ab) => {
-                eprintln!("[peel] recovered {}×{} clean product ({} elements)",
-                    m, n, clean_ab.len());
+        tokio::select! {
+            // New challenge → restart pipeline with updated sigma/difficulty
+            Ok(_) = challenge_rx.changed() => {
+                let ch = challenge_rx.borrow().clone().unwrap();
+                eprintln!("[pool] new challenge — seed={} difficulty={}",
+                    hex(&ch.seed), ch.difficulty);
+                let new_config = make_config(&ch, &mu);
+                drop(pipeline);
+                (pipeline, handle, blocks) =
+                    MiningPipeline::start(Arc::clone(&new_config), &device_ids);
             }
-            Err(PipelineError::Dropped) => {
-                eprintln!("[submit] job dropped — superseded by newer submission");
+
+            // Block found → forward to pool_task for submission
+            Some(block) = blocks.next() => {
+                let _ = block_tx.send(block).await;
             }
-            Err(PipelineError::WorkerPanic) => {
-                eprintln!("[submit] all GPU workers exited — shutting down");
-                break;
+
+            // Mining pipeline result (clean A·B)
+            result = handle.submit(Arc::clone(&a), Arc::clone(&b)) => {
+                match result {
+                    Ok(clean_ab) => {
+                        eprintln!("[peel] recovered {}×{} product ({} elements)",
+                            m, n, clean_ab.len());
+                    }
+                    Err(PipelineError::Dropped)     => {}
+                    Err(PipelineError::WorkerPanic) => {
+                        eprintln!("[submit] GPU workers exited — shutting down");
+                        break;
+                    }
+                }
             }
         }
     }

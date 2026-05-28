@@ -3,20 +3,22 @@ mod args;
 
 use std::sync::Arc;
 use anyhow::Result;
+use clap::Parser;
 use pearl_types::{MatrixParams, MiningConfig};
 use pipeline::{MiningPipeline, PipelineError};
+use args::Args;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Arc::new(MiningConfig {
-        params: MatrixParams {
-            m: 32, n: 32, k: 512, r: 32,
-            tm: 4,  tn: 4,
-        },
-        difficulty_bits: 1.0,
-        sigma: b"pearl-genesis-block".to_vec(),
-        mu:    b"miner-pubkey-placeholder".to_vec(),
-    });
+    let args = Args::parse();
+
+    let mu = args.wallet_bytes()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    args.validate_pool()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    eprintln!("[init] wallet: {}", args.wallet);
+    eprintln!("[init] pool:   {}", args.pool);
 
     let n_devices = pearl_gpu::device_count();
     if n_devices == 0 {
@@ -26,10 +28,19 @@ async fn main() -> Result<()> {
     let device_ids: Vec<u32> = (0..n_devices as u32).collect();
     eprintln!("[init] detected {} CUDA device(s): {:?}", n_devices, device_ids);
 
+    let config = Arc::new(MiningConfig {
+        params: MatrixParams {
+            m: 32, n: 32, k: 512, r: 32,
+            tm: 4,  tn: 4,
+        },
+        difficulty_bits: 1.0,
+        sigma: b"pearl-genesis-block".to_vec(),
+        mu,
+    });
+
     let (_pipeline, handle, mut blocks) =
         MiningPipeline::start(Arc::clone(&config), &device_ids);
 
-    // Print found blocks in a background task
     tokio::spawn(async move {
         while let Some(block) = blocks.next().await {
             let id    = pearl_block::block_identity(&block);
@@ -39,8 +50,6 @@ async fn main() -> Result<()> {
         eprintln!("[block] block receiver closed");
     });
 
-    // Mining loop — submit the same synthetic (A, B) pair repeatedly.
-    // In production, A and B come from the AI inference workload.
     let p = &config.params;
     let (m, n, k) = (p.m as usize, p.n as usize, p.k as usize);
     let a: Arc<[i8]> = (0..m * k)

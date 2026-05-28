@@ -56,8 +56,6 @@ async fn main() -> Result<()> {
     challenge_rx.changed().await
         .map_err(|_| anyhow::anyhow!("pool task exited before first challenge"))?;
     let first = challenge_rx.borrow().clone().unwrap();
-    eprintln!("[pool] first challenge — seed={} difficulty={}",
-        hex(&first.seed), first.difficulty);
 
     // Synthetic matrices (in production these come from the AI workload)
     let p = MatrixParams { m: 32, n: 32, k: 512, r: 32, tm: 4, tn: 4 };
@@ -68,7 +66,6 @@ async fn main() -> Result<()> {
     let b: Arc<[i8]> = (0..k * n)
         .map(|i| ((i * 11 + 5) % 128) as i8 - 64)
         .collect::<Vec<_>>().into();
-    eprintln!("[data] generated {}×{} A and {}×{} B (INT8)", m, k, k, n);
 
     let config = make_config(&first, &mu);
     let (mut pipeline, mut handle, mut blocks) =
@@ -79,8 +76,6 @@ async fn main() -> Result<()> {
             // New challenge → restart pipeline with updated sigma/difficulty
             Ok(_) = challenge_rx.changed() => {
                 let ch = challenge_rx.borrow().clone().unwrap();
-                eprintln!("[pool] new challenge — seed={} difficulty={}",
-                    hex(&ch.seed), ch.difficulty);
                 let new_config = make_config(&ch, &mu);
                 drop(pipeline);
                 (pipeline, handle, blocks) =
@@ -95,10 +90,7 @@ async fn main() -> Result<()> {
             // Mining pipeline result (clean A·B)
             result = handle.submit(Arc::clone(&a), Arc::clone(&b)) => {
                 match result {
-                    Ok(clean_ab) => {
-                        eprintln!("[peel] recovered {}×{} product ({} elements)",
-                            m, n, clean_ab.len());
-                    }
+                    Ok(_clean_ab) => {}
                     Err(PipelineError::Dropped)     => {}
                     Err(PipelineError::WorkerPanic) => {
                         eprintln!("[submit] GPU workers exited — shutting down");
@@ -112,6 +104,3 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}

@@ -71,8 +71,8 @@ pub async fn pool_task_inner(
                             match result {
                                 Ok(Some(line)) => {
                                     if let Some(ch) = parse_challenge(&line) {
-                                        eprintln!("[pool] challenge seed={} difficulty={}",
-                                            fmt_hex(&ch.seed), ch.difficulty);
+                                        eprintln!("[pool] challenge seed={}… diff={}",
+                                            &fmt_hex(&ch.seed)[..8], ch.difficulty);
                                         challenge_tx.send_replace(Some(ch));
                                     }
                                     // unknown method: silently ignore

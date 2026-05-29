@@ -1,1 +1,5 @@
-// Pearl commitment library — commitment schemes
+mod commitment;
+mod merkle;
+
+pub use commitment::compute;
+pub use merkle::MerkleTree;

@@ -1,0 +1,11 @@
+[package]
+name = "pearl-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pearl-types = { path = "../pearl-types" }
+cudarc = { version = "0.12", default-features = false, features = ["driver", "nvrtc", "cuda-12000"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+anyhow = "1"

@@ -304,119 +304,14 @@ extern "C" __global__ void tiled_matmul_dp4a(
 }
 
 /* ------------------------------------------------------------------ */
-/*  Kernel B: WMMA INT8 tensor cores                                   */
-/*    sm_80+ (Ampere/Ada): m16n8k32 — native Ampere tensor core        */
-/*    sm_72–79 (Turing):   m16n16k16 — Turing tensor core              */
+/*  Kernel B: WMMA INT8 tensor cores (sm_72+, all RTX/tensor cards)   */
+/*                                                                     */
+/*  Uses m16n16k16 INT8 for all targets.                               */
+/*  On sm_86/89, nvcc maps this to native m16n8k16 pairs internally — */
+/*  correct and efficient without requiring col_major B storage.        */
 /* ------------------------------------------------------------------ */
 
-#if __CUDA_ARCH__ >= 800
-
-#include <mma.h>
-using namespace nvcuda::wmma;
-
-extern "C" __global__ void tiled_matmul_wmma(
-    const int8_t* __restrict__ A,
-    const int8_t* __restrict__ B,
-    int32_t*      __restrict__ C,    // unused — ABI compat
-    uint32_t*     __restrict__ M_out,
-    int m, int n, int k, int r
-) {
-    /*
-     * blockDim = (32, 8) — 8 warps, each owns one 16×16 output tile.
-     * gridDim  = (n/16, (m+127)/128)
-     * smem     = 9 × r × 16 bytes
-     *
-     * Two m16n8k32 accumulators per warp cover the full 16×16 output tile:
-     *   acc_l → cols [0..7], acc_r → cols [8..15]
-     * For r=32: sub_steps = r/32 = 1 (one pass, no inner loop).
-     */
-    extern __shared__ int32_t smem_wmma[];
-
-    const int warp_id    = threadIdx.y;
-    const int lane       = threadIdx.x;
-    const int tid        = warp_id * 32 + lane;
-
-    const int tile_i     = blockIdx.y * 8 + warp_id;
-    const int tile_j     = blockIdx.x;
-    const bool active    = (tile_i * 16 < m && tile_j * 16 < n);
-    const int  a_row_base = tile_i * 16;
-    const int  b_col_base = tile_j * 16;
-
-    int8_t* Bs  = (int8_t*)smem_wmma;
-    int8_t* wAs = Bs + r * 16 + warp_id * 16 * r;
-
-    fragment<accumulator, 16, 8, 32, int32_t> acc_l, acc_r;
-    fill_fragment(acc_l, 0);
-    fill_fragment(acc_r, 0);
-
-    uint32_t M[16];
-    #pragma unroll
-    for (int q = 0; q < 16; q++) M[q] = 0;
-
-    const int num_steps = k / r;
-    const int sub_steps = r / 32;   // = 1 for default r=32
-
-    for (int ell = 0; ell < num_steps; ell++) {
-        const int s = ell * r;
-
-        for (int idx = tid; idx < r * 16; idx += 256) {
-            int row = idx / 16, col = idx % 16;
-            int gcol = b_col_base + col;
-            Bs[row * 16 + col] = ((s + row) < k && gcol < n)
-                ? B[(s + row) * n + gcol] : (int8_t)0;
-        }
-        __syncthreads();
-
-        if (active) {
-            for (int idx = lane; idx < 16 * r; idx += 32) {
-                int row = idx / r, col = idx % r;
-                int grow = a_row_base + row;
-                wAs[idx] = (grow < m && (s + col) < k)
-                    ? A[grow * k + s + col] : (int8_t)0;
-            }
-            __syncwarp();
-
-            for (int sub = 0; sub < sub_steps; sub++) {
-                fragment<matrix_a, 16, 8, 32, int8_t, row_major> a_frag;
-                fragment<matrix_b, 16, 8, 32, int8_t, row_major> b_frag_l, b_frag_r;
-
-                load_matrix_sync(a_frag,   wAs + sub * 32,           r);
-                load_matrix_sync(b_frag_l, Bs  + sub * 32 * 16,     16);
-                load_matrix_sync(b_frag_r, Bs  + sub * 32 * 16 + 8, 16);
-
-                mma_sync(acc_l, a_frag, b_frag_l, acc_l);
-                mma_sync(acc_r, a_frag, b_frag_r, acc_r);
-            }
-
-            uint32_t local_xor = 0;
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                local_xor ^= (uint32_t)acc_l.x[i];
-                local_xor ^= (uint32_t)acc_r.x[i];
-            }
-            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor, 16);
-            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  8);
-            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  4);
-            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  2);
-            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  1);
-            if (lane == 0)
-                M[ell & 15] = rol32(M[ell & 15], 13) ^ local_xor;
-        }
-
-        __syncthreads();
-    }
-
-    if (!active) return;
-
-    if (lane == 0) {
-        int num_tiles_n = (n + 15) / 16;
-        int base = (tile_i * num_tiles_n + tile_j) * 16;
-        #pragma unroll
-        for (int q = 0; q < 16; q++) M_out[base + q] = M[q];
-    }
-}
-
-#elif __CUDA_ARCH__ >= 720
+#if __CUDA_ARCH__ >= 720
 
 #include <mma.h>
 using namespace nvcuda::wmma;

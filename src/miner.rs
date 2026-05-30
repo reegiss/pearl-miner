@@ -1,7 +1,7 @@
 use crate::pool::Submit;
-use pearl_commitment::{compute_challenge, compute_sa};
+use pearl_commitment::compute_challenge;
 use pearl_gpu::GpuMiner;
-use pearl_noise::{apply_e, apply_f, generate_e, generate_f};
+use pearl_noise::{apply_f, generate_f};
 use pearl_types::MiningParams;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,8 +13,8 @@ const DEFAULT_R:  usize = 32;
 const DEFAULT_K:  usize = 512;
 const DEFAULT_TM: usize = 16;
 const DEFAULT_TN: usize = 16;
-const DEFAULT_M:  usize = 1024;
-const DEFAULT_N:  usize = 1024;
+const DEFAULT_M:  usize = 4096;
+const DEFAULT_N:  usize = 4096;
 
 pub struct Miner {
     gpus: Vec<Arc<GpuMiner>>,
@@ -146,38 +146,28 @@ fn mining_loop(
     let start          = Instant::now();
     let mut last_log   = start;
 
-    // Profiling accumulators (µs)
-    let mut t_rand   = 0u128;
-    let mut t_commit = 0u128;
-    let mut t_noise  = 0u128;
-    let mut t_apply  = 0u128;
-    let mut t_gpu    = 0u128;
+    // Profiling accumulator (µs)
+    let mut t_gpu = 0u128;
 
     while !cancel.load(Ordering::Relaxed) {
         job += 1;
-        let seed_a = (job - 1) * n_gpus as u64 + gpu_idx as u64;
+        let job_seed = (job - 1) * n_gpus as u64 + gpu_idx as u64;
+
+        // One BLAKE3 call: virtual sA seeded from challenge kappa + job counter.
+        // All heavy matrix work (A generation, noise, noise application) is on GPU.
+        let virtual_sa = *blake3::keyed_hash(&cc.kappa, &job_seed.to_le_bytes()).as_bytes();
 
         let t0 = Instant::now();
-        let a = random_matrix_i8(params.m, params.k, seed_a);
-        t_rand += t0.elapsed().as_micros();
 
-        let t0 = Instant::now();
-        let (s_a, _) = compute_sa(&a, cc);
-        t_commit += t0.elapsed().as_micros();
+        // GPU: generate A' = A + EL·ER using splitmix64 PRNG
+        if let Err(e) = gpu.generate_noisy_a(job_seed, &virtual_sa, params) {
+            eprintln!("[gpu:{gpu_idx}] generate error: {e}"); break;
+        }
 
-        let t0 = Instant::now();
-        let e_noise = generate_e(params.m, params.k, params.r, &s_a);
-        t_noise += t0.elapsed().as_micros();
-
-        let t0 = Instant::now();
-        let a_prime = apply_e(&a, &e_noise, params.m, params.k, params.r);
-        t_apply += t0.elapsed().as_micros();
-
-        let t0 = Instant::now();
-        match gpu.mine(&a_prime, params, &s_a) {
+        // GPU: tiled matmul A'·B', M-state accumulation, BLAKE3 difficulty check
+        match gpu.mine(params, &virtual_sa) {
             Ok(blocks) if !blocks.is_empty() => {
                 for blk in &blocks {
-                    // Log found PoUW tiles — not submitted until proof format is confirmed
                     println!(
                         "[PoUW] gpu:{gpu_idx} tile=({},{}) hash={} wallet={wallet}",
                         blk.tile_i, blk.tile_j, hex_bytes(&blk.hash),
@@ -185,7 +175,7 @@ fn mining_loop(
                 }
             }
             Ok(_) => {}
-            Err(e) => { eprintln!("[gpu:{gpu_idx}] error: {e}"); break; }
+            Err(e) => { eprintln!("[gpu:{gpu_idx}] mine error: {e}"); break; }
         }
         t_gpu += t0.elapsed().as_micros();
 
@@ -195,22 +185,17 @@ fn mining_loop(
         if gpu_idx == 0 && job % 100 == 0 {
             let now     = Instant::now();
             let elapsed = (now - start).as_secs_f64().max(0.001);
-            let per     = |t: u128| t as f64 / job as f64 / 1000.0; // ms/job
+            let kernel  = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
             println!(
-                "[miner] {} · seed={} · job={}",
+                "[miner] {} · seed={} · job={} [{kernel}] gpu={:.2}ms/job",
                 fmt_hashrate(new_total as f64 / elapsed),
                 &seed_hex[..16],
                 job * n_gpus as u64,
-            );
-            let kernel = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
-            println!(
-                "[profile/{kernel}] rand={:.2}ms commit={:.2}ms noise={:.2}ms apply={:.2}ms gpu={:.2}ms  total={:.2}ms/job",
-                per(t_rand), per(t_commit), per(t_noise), per(t_apply), per(t_gpu),
-                per(t_rand + t_commit + t_noise + t_apply + t_gpu),
+                t_gpu as f64 / job as f64 / 1000.0,
             );
             last_log = now;
         }
-        let _ = last_log; // suppress unused warning
+        let _ = last_log;
     }
 }
 

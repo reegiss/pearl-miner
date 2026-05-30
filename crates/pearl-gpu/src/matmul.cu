@@ -27,6 +27,64 @@ __device__ __forceinline__ uint32_t rol32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
 
+// splitmix64 — independent element seeding (no sequential state needed)
+__device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+// Derive a unique seed for element (row, col) from base seed
+__device__ __forceinline__ uint64_t elem_seed(uint64_t base, uint64_t row, uint64_t col) {
+    return splitmix64(base ^ (row * 0x9e3779b97f4a7c15ULL) ^ (col * 0xd1b54a32d192ed03ULL));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Kernel C: generate A' = A + EL·ER entirely on GPU                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * blockDim = (32, 16, 1) — 512 threads per block
+ * gridDim  = ((k+31)/32, (m+15)/16, 1)
+ *
+ * Each thread computes one element of A' using splitmix64 PRNG:
+ *   A[i][j]        ← elem_seed(job_seed, i, j)
+ *   ER pos/neg_col ← elem_seed(sa_seed^0x100, 0, j) % r
+ *   EL[i][pos_col] ← elem_seed(sa_seed^0x200, i, pos_col)
+ *   A'[i][j]       = clamp(A[i][j] + EL[i][pos_col] − EL[i][neg_col])
+ *
+ * No inter-thread communication required — fully parallel.
+ */
+extern "C" __global__ void generate_noisy_a(
+    int8_t*  __restrict__ A_prime,
+    uint64_t job_seed,
+    uint64_t sa_seed,
+    int m, int k, int r
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= m || col >= k) return;
+
+    // A[row][col] in [-64, 63]
+    int8_t a_val = (int8_t)((elem_seed(job_seed, (uint64_t)row, (uint64_t)col) & 0x7F) - 64);
+
+    // ER: column `col` has one +1 at pos_col and one -1 at neg_col in [0, r)
+    uint64_t er_s = elem_seed(sa_seed ^ 0x100ULL, 0ULL, (uint64_t)col);
+    int pos_col   = (int)(er_s % (uint64_t)r);
+    er_s = splitmix64(er_s);
+    int neg_col   = (int)(er_s % (uint64_t)r);
+    if (neg_col == pos_col) neg_col = (neg_col + 1) % r;
+
+    // EL[row][pos_col] and EL[row][neg_col] in [-32, 31]
+    int8_t el_pos = (int8_t)((elem_seed(sa_seed ^ 0x200ULL, (uint64_t)row, (uint64_t)pos_col) & 0x3F) - 32);
+    int8_t el_neg = (int8_t)((elem_seed(sa_seed ^ 0x200ULL, (uint64_t)row, (uint64_t)neg_col) & 0x3F) - 32);
+
+    int val = (int)a_val + (int)el_pos - (int)el_neg;
+    if (val >  127) val =  127;
+    if (val < -127) val = -127;
+    A_prime[row * k + col] = (int8_t)val;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Kernel A: DP4A (CUDA cores, sm_61+)                                */
 /* ------------------------------------------------------------------ */

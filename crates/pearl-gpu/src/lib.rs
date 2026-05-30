@@ -29,19 +29,18 @@ pub fn device_count() -> usize {
 
 pub struct GpuMiner {
     #[allow(dead_code)]
-    ctx:       Arc<CudaContext>,
-    stream:    Arc<CudaStream>,
+    ctx:        Arc<CudaContext>,
+    stream:     Arc<CudaStream>,
     #[allow(dead_code)]
-    module:    Arc<CudaModule>,
-    func_dp4a: CudaFunction,
-    func_wmma: CudaFunction,
-    use_wmma:  bool,
-    // Pre-allocated device buffers — separate Mutexes to satisfy borrow checker
-    // with cudarc's builder pattern (immutable + mutable borrows coexist)
-    d_a: Mutex<CudaSlice<i8>>,   // A' (m×k) — uploaded per job
+    module:     Arc<CudaModule>,
+    func_dp4a:  CudaFunction,
+    func_wmma:  CudaFunction,
+    func_gen_a: CudaFunction,
+    use_wmma:   bool,
+    d_a: Mutex<CudaSlice<i8>>,   // A' (m×k) — written by generate_noisy_a kernel
     d_b: Mutex<CudaSlice<i8>>,   // B' (k×n) — uploaded once per challenge
-    d_c: Mutex<CudaSlice<i32>>,  // C  (m×n) — written by kernel
-    d_m: Mutex<CudaSlice<u32>>,  // M states (tiles×16) — written by kernel
+    d_c: Mutex<CudaSlice<i32>>,  // C  (m×n) — written by matmul kernel
+    d_m: Mutex<CudaSlice<u32>>,  // M states (tiles×16) — written by matmul kernel
     m: usize, n: usize, k: usize, r: usize,
     num_tiles_m: usize, num_tiles_n: usize,
     pub info: GpuInfo,
@@ -55,9 +54,10 @@ impl GpuMiner {
         let stream = ctx.default_stream();
         let module = ctx.load_module(Ptx::from_src(MATMUL_PTX))?;
 
-        let func_dp4a = module.load_function("tiled_matmul_dp4a")?;
-        let func_wmma = module.load_function("tiled_matmul_wmma")?;
-        let use_wmma  = has_tensor_cores(&name);
+        let func_dp4a  = module.load_function("tiled_matmul_dp4a")?;
+        let func_wmma  = module.load_function("tiled_matmul_wmma")?;
+        let func_gen_a = module.load_function("generate_noisy_a")?;
+        let use_wmma   = has_tensor_cores(&name);
 
         let (m, n, k, r) = (params.m, params.n, params.k, params.r);
         let num_tiles_m  = (m + TM - 1) / TM;
@@ -71,7 +71,7 @@ impl GpuMiner {
 
         Ok(Self {
             ctx, stream, module,
-            func_dp4a, func_wmma, use_wmma,
+            func_dp4a, func_wmma, func_gen_a, use_wmma,
             d_a, d_b, d_c, d_m,
             m, n, k, r, num_tiles_m, num_tiles_n,
             info: GpuInfo { name, mem_mb, use_wmma },
@@ -84,19 +84,37 @@ impl GpuMiner {
         Ok(())
     }
 
-    /// Mine one job: upload A', run kernel, check BLAKE3 difficulty on CPU.
+    /// Generate A' = A + EL·ER entirely on GPU using splitmix64 PRNG.
+    /// Call before `mine()` each job. No CPU-side matrix work required.
+    pub fn generate_noisy_a(
+        &self,
+        job_seed: u64,
+        sa_seed:  &[u8; 32],
+        params:   &MiningParams,
+    ) -> Result<(), GpuError> {
+        let sa_u64: u64 = u64::from_le_bytes(sa_seed[..8].try_into().unwrap());
+        let (mi, ki, ri) = (params.m as i32, params.k as i32, params.r as i32);
+        let bx = 32u32; let by = 16u32;
+        let gx = (params.k as u32 + bx - 1) / bx;
+        let gy = (params.m as u32 + by - 1) / by;
+        let cfg = LaunchConfig { grid_dim: (gx, gy, 1), block_dim: (bx, by, 1), shared_mem_bytes: 0 };
+        let mut d_a = self.d_a.lock().unwrap();
+        let mut b   = self.stream.launch_builder(&self.func_gen_a);
+        b.arg(&mut *d_a); b.arg(&job_seed); b.arg(&sa_u64); b.arg(&mi); b.arg(&ki); b.arg(&ri);
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// Run the matmul kernel on d_a (already filled) and check BLAKE3 difficulty.
+    /// Pair with `generate_noisy_a` for the GPU-only pipeline.
     pub fn mine(
         &self,
-        a_prime: &[i8],
-        params:  &MiningParams,
-        s_a:     &[u8; 32],
+        params: &MiningParams,
+        s_a:    &[u8; 32],
     ) -> Result<Vec<FoundBlock>, GpuError> {
         let (m, n, k, r)    = (self.m, self.n, self.k, self.r);
         let (ntm, ntn)      = (self.num_tiles_m, self.num_tiles_n);
         let (mi, ni, ki, ri) = (m as i32, n as i32, k as i32, r as i32);
-
-        // Upload A' — mutable borrow, release lock before kernel launch
-        { self.stream.memcpy_htod(a_prime, &mut *self.d_a.lock().unwrap())?; }
 
         // Acquire all four buffers for kernel launch (no contention — 1 thread/GPU)
         let d_a  = self.d_a.lock().unwrap();

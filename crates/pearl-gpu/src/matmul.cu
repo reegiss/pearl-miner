@@ -26,6 +26,117 @@
 __device__ __forceinline__ uint32_t rol32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
+__device__ __forceinline__ uint32_t ror32(uint32_t x, int n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+/* ------------------------------------------------------------------ */
+/*  BLAKE3 compress (64-byte message, keyed hash, single block/root)   */
+/* ------------------------------------------------------------------ */
+
+__constant__ uint32_t BLAKE3_IV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
+};
+
+// flags: CHUNK_START|CHUNK_END|ROOT|KEYED_HASH = 1|2|8|16 = 27
+#define BLAKE3_DOMAIN 27u
+
+__constant__ uint8_t BLAKE3_MSG_SCHED[7][16] = {
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15},
+    { 2, 6, 3,10, 7, 0, 4,13, 1,11,12, 5, 9,14,15, 8},
+    { 3, 4,10,12,13, 2, 7,14, 6, 5, 9, 0,11,15, 8, 1},
+    {10, 7,12, 9,14, 3,13,15, 4, 0,11, 2, 5, 8, 1, 6},
+    {12,13, 9,11,15,10,14, 8, 7, 2, 5, 3, 0, 1, 6, 4},
+    { 9,14,11, 5, 8,12,15, 1,13, 3, 0,10, 2, 6, 4, 7},
+    {11,15, 5, 0, 1, 9, 8, 6,14,10, 2,12, 3, 4, 7,13},
+};
+
+__device__ __forceinline__ void blake3_g(
+    uint32_t* v, int a, int b, int c, int d, uint32_t x, uint32_t y
+) {
+    v[a] += v[b] + x;  v[d] = ror32(v[d] ^ v[a], 16);
+    v[c] += v[d];      v[b] = ror32(v[b] ^ v[c], 12);
+    v[a] += v[b] + y;  v[d] = ror32(v[d] ^ v[a],  8);
+    v[c] += v[d];      v[b] = ror32(v[b] ^ v[c],  7);
+}
+
+// key[8]: sA as 8 LE-u32 words  msg[16]: M-state u32[16]  out[8]: hash u32[8]
+__device__ void blake3_hash64(const uint32_t* key, const uint32_t* msg, uint32_t* out) {
+    uint32_t v[16];
+    v[0]=key[0]; v[1]=key[1]; v[2]=key[2]; v[3]=key[3];
+    v[4]=key[4]; v[5]=key[5]; v[6]=key[6]; v[7]=key[7];
+    v[8]=BLAKE3_IV[0]; v[9]=BLAKE3_IV[1]; v[10]=BLAKE3_IV[2]; v[11]=BLAKE3_IV[3];
+    v[12]=0; v[13]=0; v[14]=64; v[15]=BLAKE3_DOMAIN;
+
+    #pragma unroll
+    for (int r = 0; r < 7; r++) {
+        const uint8_t* s = BLAKE3_MSG_SCHED[r];
+        blake3_g(v, 0, 4,  8, 12, msg[s[ 0]], msg[s[ 1]]);
+        blake3_g(v, 1, 5,  9, 13, msg[s[ 2]], msg[s[ 3]]);
+        blake3_g(v, 2, 6, 10, 14, msg[s[ 4]], msg[s[ 5]]);
+        blake3_g(v, 3, 7, 11, 15, msg[s[ 6]], msg[s[ 7]]);
+        blake3_g(v, 0, 5, 10, 15, msg[s[ 8]], msg[s[ 9]]);
+        blake3_g(v, 1, 6, 11, 12, msg[s[10]], msg[s[11]]);
+        blake3_g(v, 2, 7,  8, 13, msg[s[12]], msg[s[13]]);
+        blake3_g(v, 3, 4,  9, 14, msg[s[14]], msg[s[15]]);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) out[i] = v[i] ^ v[i + 8];
+}
+
+// Both hash and threshold stored as 8 LE-u32 words. Compare as uint256 big-endian.
+__device__ __forceinline__ bool hash_le_threshold(const uint32_t* h, const uint32_t* t) {
+    for (int i = 7; i >= 0; i--) {
+        if (h[i] < t[i]) return true;
+        if (h[i] > t[i]) return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Kernel D: BLAKE3 difficulty check on GPU                           */
+/*  Reads M_out, checks threshold, writes winning tiles to d_found.   */
+/*                                                                     */
+/*  d_found layout per entry (FOUND_STRIDE = 26 u32):                  */
+/*    [0]    tile_i                                                     */
+/*    [1]    tile_j                                                     */
+/*    [2..17] m_state[16]                                              */
+/*    [18..25] hash_words[8]                                           */
+/* ------------------------------------------------------------------ */
+
+#define FOUND_STRIDE 26
+#define MAX_FOUND    256
+
+extern "C" __global__ void blake3_check(
+    const uint32_t* __restrict__ M_out,
+    const uint32_t* __restrict__ sa_key,    // 8 u32
+    const uint32_t* __restrict__ threshold, // 8 u32
+    uint32_t*       __restrict__ d_found,
+    uint32_t*       __restrict__ d_found_count,
+    int num_tiles,
+    int num_tiles_n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_tiles) return;
+
+    const uint32_t* m = M_out + idx * 16;
+    uint32_t hash_out[8];
+    blake3_hash64(sa_key, m, hash_out);
+
+    if (!hash_le_threshold(hash_out, threshold)) return;
+
+    int pos = (int)atomicAdd(d_found_count, 1u);
+    if (pos >= MAX_FOUND) return;
+
+    int base = pos * FOUND_STRIDE;
+    d_found[base + 0] = (uint32_t)(idx / num_tiles_n);   // tile_i
+    d_found[base + 1] = (uint32_t)(idx % num_tiles_n);   // tile_j
+    #pragma unroll
+    for (int q = 0; q < 16; q++) d_found[base + 2  + q] = m[q];
+    #pragma unroll
+    for (int q = 0; q < 8;  q++) d_found[base + 18 + q] = hash_out[q];
+}
 
 // splitmix64 — independent element seeding (no sequential state needed)
 __device__ __forceinline__ uint64_t splitmix64(uint64_t x) {

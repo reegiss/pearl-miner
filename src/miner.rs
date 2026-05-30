@@ -182,7 +182,7 @@ fn mining_loop(
 
         if gpu_idx == 0 {
             let now = Instant::now();
-            if (now - last_log).as_secs_f64() >= 5.0 {
+            if (now - last_log).as_secs_f64() >= 10.0 {
                 let elapsed = (now - start).as_secs_f64().max(0.001);
                 let kernel  = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
                 let j = job as f64;

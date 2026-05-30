@@ -61,8 +61,14 @@ __device__ __forceinline__ void blake3_g(
     v[c] += v[d];      v[b] = ror32(v[b] ^ v[c],  7);
 }
 
-// key[8]: sA as 8 LE-u32 words  msg[16]: M-state u32[16]  out[8]: hash u32[8]
+// key[8]: sA as 8 LE-u32 words  msg[16]: M-state u32[16] (global ptr)  out[8]: hash u32[8]
 __device__ void blake3_hash64(const uint32_t* key, const uint32_t* msg, uint32_t* out) {
+    // Pre-load message into registers: avoids strided global-memory accesses
+    // inside the 7-round loop (each blake3_g call would otherwise re-fetch from global).
+    uint32_t m[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) m[i] = msg[i];
+
     uint32_t v[16];
     v[0]=key[0]; v[1]=key[1]; v[2]=key[2]; v[3]=key[3];
     v[4]=key[4]; v[5]=key[5]; v[6]=key[6]; v[7]=key[7];
@@ -72,14 +78,14 @@ __device__ void blake3_hash64(const uint32_t* key, const uint32_t* msg, uint32_t
     #pragma unroll
     for (int r = 0; r < 7; r++) {
         const uint8_t* s = BLAKE3_MSG_SCHED[r];
-        blake3_g(v, 0, 4,  8, 12, msg[s[ 0]], msg[s[ 1]]);
-        blake3_g(v, 1, 5,  9, 13, msg[s[ 2]], msg[s[ 3]]);
-        blake3_g(v, 2, 6, 10, 14, msg[s[ 4]], msg[s[ 5]]);
-        blake3_g(v, 3, 7, 11, 15, msg[s[ 6]], msg[s[ 7]]);
-        blake3_g(v, 0, 5, 10, 15, msg[s[ 8]], msg[s[ 9]]);
-        blake3_g(v, 1, 6, 11, 12, msg[s[10]], msg[s[11]]);
-        blake3_g(v, 2, 7,  8, 13, msg[s[12]], msg[s[13]]);
-        blake3_g(v, 3, 4,  9, 14, msg[s[14]], msg[s[15]]);
+        blake3_g(v, 0, 4,  8, 12, m[s[ 0]], m[s[ 1]]);
+        blake3_g(v, 1, 5,  9, 13, m[s[ 2]], m[s[ 3]]);
+        blake3_g(v, 2, 6, 10, 14, m[s[ 4]], m[s[ 5]]);
+        blake3_g(v, 3, 7, 11, 15, m[s[ 6]], m[s[ 7]]);
+        blake3_g(v, 0, 5, 10, 15, m[s[ 8]], m[s[ 9]]);
+        blake3_g(v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+        blake3_g(v, 2, 7,  8, 13, m[s[12]], m[s[13]]);
+        blake3_g(v, 3, 4,  9, 14, m[s[14]], m[s[15]]);
     }
     #pragma unroll
     for (int i = 0; i < 8; i++) out[i] = v[i] ^ v[i + 8];

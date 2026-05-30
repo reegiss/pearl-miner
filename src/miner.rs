@@ -100,7 +100,6 @@ impl Miner {
                 handles.push(tokio::task::spawn_blocking(move || {
                     if let Some(nonce) = solve_blake3_challenge(sigma, difficulty, &cancel_c) {
                         let nonce_hex = format!("{:016x}", nonce);
-                        println!("[BLAKE3] Challenge solved! nonce={nonce_hex}");
                         let _ = submit_c.blocking_send(Submit { seed: seed_c, nonce: nonce_hex });
                     }
                 }));
@@ -167,10 +166,8 @@ fn mining_loop(
         };
 
         for fb in found_blocks {
-            let nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
-            println!("[PoUW] Found block! hash={}", &nonce_hex[..16]);
-            // NOTE: Do not submit PoUW blocks to pearl.challenge_response.
-            // That method is for BLAKE3 challenge nonces only.
+            let _nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
+            // PoUW blocks are not submitted to pearl.challenge_response.
         }
 
         let _ = wallet;
@@ -305,6 +302,11 @@ fn hex_nibble(b: u8) -> Option<u8> {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+' => Some(b - b'A' + 10),
         _ => None,
     }
 }

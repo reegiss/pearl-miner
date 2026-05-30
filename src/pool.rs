@@ -123,7 +123,6 @@ async fn connect(
                     "params": { "seed": submit.seed, "nonce": submit.nonce }
                 });
                 msg_id += 1;
-                println!("[pool] -> submit nonce={}", &submit.nonce[..16]);
                 writer.write_all(format!("{msg}\n").as_bytes()).await?;
             }
         }

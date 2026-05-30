@@ -27,7 +27,8 @@ impl Miner {
         let mut gpus = Vec::with_capacity(device_ids.len());
         for &id in device_ids {
             let gpu = GpuMiner::new(id)?;
-            println!("[gpu:{}] {} · {} MB", id, gpu.info.name, gpu.info.mem_mb);
+            let kernel = if gpu.info.use_wmma { "WMMA tensor cores" } else { "DP4A CUDA cores" };
+            println!("[gpu:{}] {} · {} MB · {}", id, gpu.info.name, gpu.info.mem_mb, kernel);
             gpus.push(Arc::new(gpu));
         }
         Ok(Self { gpus })
@@ -124,16 +125,34 @@ fn mining_loop(
     let start          = Instant::now();
     let mut last_log   = start;
 
+    // Profiling accumulators (µs)
+    let mut t_rand = 0u128;
+    let mut t_commit = 0u128;
+    let mut t_noise = 0u128;
+    let mut t_apply = 0u128;
+    let mut t_gpu  = 0u128;
+
     while !cancel.load(Ordering::Relaxed) {
         job += 1;
         let seed_a = (job - 1) * n_gpus as u64 + gpu_idx as u64;
 
-        // Only A changes per job — B' is pre-computed
+        let t0 = Instant::now();
         let a = random_matrix_i8(params.m, params.k, seed_a);
-        let (s_a, _) = compute_sa(&a, cc);
-        let e_noise  = generate_e(params.m, params.k, params.r, &s_a);
-        let a_prime  = apply_e(&a, &e_noise, params.m, params.k, params.r);
+        t_rand += t0.elapsed().as_micros();
 
+        let t0 = Instant::now();
+        let (s_a, _) = compute_sa(&a, cc);
+        t_commit += t0.elapsed().as_micros();
+
+        let t0 = Instant::now();
+        let e_noise = generate_e(params.m, params.k, params.r, &s_a);
+        t_noise += t0.elapsed().as_micros();
+
+        let t0 = Instant::now();
+        let a_prime = apply_e(&a, &e_noise, params.m, params.k, params.r);
+        t_apply += t0.elapsed().as_micros();
+
+        let t0 = Instant::now();
         match gpu.mine(&a_prime, b_prime, params, &s_a) {
             Ok(blocks) if !blocks.is_empty() => {
                 for blk in &blocks {
@@ -152,19 +171,26 @@ fn mining_loop(
             Ok(_) => {}
             Err(e) => { eprintln!("[gpu:{gpu_idx}] error: {e}"); break; }
         }
+        t_gpu += t0.elapsed().as_micros();
 
         let new_total = total_hashes.fetch_add(tiles_per_job, Ordering::Relaxed) + tiles_per_job;
 
-        // GPU 0 prints combined hashrate periodically
+        // GPU 0 prints combined hashrate + profile breakdown periodically
         if gpu_idx == 0 {
             let now = Instant::now();
             if (now - last_log).as_secs_f64() >= LOG_INTERVAL_S {
                 let elapsed = (now - start).as_secs_f64().max(0.001);
+                let per = |t: u128| t as f64 / job as f64 / 1000.0; // ms per job
                 println!(
                     "[miner] {} · seed={} · job={}",
                     fmt_hashrate(new_total as f64 / elapsed),
                     &seed_hex[..16],
                     job * n_gpus as u64,
+                );
+                println!(
+                    "[profile] rand={:.2}ms commit={:.2}ms noise={:.2}ms apply={:.2}ms gpu={:.2}ms  total={:.2}ms/job",
+                    per(t_rand), per(t_commit), per(t_noise), per(t_apply), per(t_gpu),
+                    per(t_rand + t_commit + t_noise + t_apply + t_gpu),
                 );
                 last_log = now;
             }

@@ -8,7 +8,9 @@ fn main() {
     let ptx_path = out_dir.join("matmul.ptx");
     let cu_path = "src/matmul.cu";
 
-    // Compile .cu → .ptx targeting sm_75 (Turing+, covers 16xx/20xx/30xx/40xx/50xx via JIT)
+    // Compile .cu → .ptx
+    // sm_75: base target (Turing — GTX 16xx, RTX 20xx); JIT compiles to sm_86/89/100 on newer GPUs
+    // WMMA INT8 is guarded by __CUDA_ARCH__ >= 720 in the .cu file
     let status = Command::new("nvcc")
         .args([
             "-ptx",

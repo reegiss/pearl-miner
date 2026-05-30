@@ -1,30 +1,37 @@
 /*
- * Pearl PoUW — Tiled INT8 MatMul with warp-level M-state accumulation
+ * Pearl PoUW — Tiled INT8 MatMul kernels
  *
- * One thread block per output tile (i,j), TM×TN threads.
- * Depth loop: for each of k/r depth steps, accumulate INT32, then
- * update M[16] using a two-phase XOR reduction:
- *   1. __reduce_xor_sync within each warp  (hardware, 5 cycles)
- *   2. thread 0 combines all warp results  (WARPS_PER_BLOCK iterations)
+ * Two implementations selected at runtime:
+ *   tiled_matmul_dp4a  — DP4A on CUDA cores (sm_61+, all NVIDIA GPUs)
+ *   tiled_matmul_wmma  — Tensor cores via WMMA INT8 (sm_72+, RTX cards)
  *
- * Dynamic shared memory layout:
- *   [0            .. TM*r)       int8  As[TM][r]
- *   [TM*r         .. (TM+TN)*r)  int8  Bs[r][TN]
- *   [(TM+TN)*r    .. +4*WARPS)   u32   warp_xors[WARPS_PER_BLOCK]
- *   [above+4*WARPS.. +64)        u32   M[16]
+ * WMMA layout (per tile):
+ *   blockDim = (32, 1)  — 1 warp handles one 16×16 output tile
+ *   gridDim  = (n/16, m/16)
+ *   Depth step r=32 → 2 sub-steps of 16, each a 16×16×16 mma_sync call
+ *   M-state XOR: each thread XORs its 8 accumulator elements, then
+ *   warp butterfly reduction via __shfl_xor_sync
  */
 
 #include <stdint.h>
 
+/* ------------------------------------------------------------------ */
+/*  Shared helpers                                                      */
+/* ------------------------------------------------------------------ */
+
 #define TM 16
 #define TN 16
-#define WARPS_PER_BLOCK ((TM * TN) / 32)
+#define WARPS_PER_BLOCK_DP4A ((TM * TN) / 32)
 
 __device__ __forceinline__ uint32_t rol32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
 
-extern "C" __global__ void tiled_matmul(
+/* ------------------------------------------------------------------ */
+/*  Kernel A: DP4A (CUDA cores, sm_61+)                                */
+/* ------------------------------------------------------------------ */
+
+extern "C" __global__ void tiled_matmul_dp4a(
     const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     int32_t*      __restrict__ C,
@@ -36,7 +43,7 @@ extern "C" __global__ void tiled_matmul(
     int8_t*  As        = (int8_t*)smem;
     int8_t*  Bs        = (int8_t*)smem + TM * r;
     uint32_t* warp_xors = (uint32_t*)(smem + (TM + TN) * r);
-    uint32_t* M         = warp_xors + WARPS_PER_BLOCK;
+    uint32_t* M         = warp_xors + WARPS_PER_BLOCK_DP4A;
 
     const int tile_i = blockIdx.y;
     const int tile_j = blockIdx.x;
@@ -46,12 +53,8 @@ extern "C" __global__ void tiled_matmul(
     const int lane   = tid & 31;
     const int warp   = tid >> 5;
 
-    const int gi = tile_i * TM + ty;
-    const int gj = tile_j * TN + tx;
-
     int32_t acc = 0;
 
-    // Init M state
     if (tid < 16) M[tid] = 0;
     __syncthreads();
 
@@ -60,7 +63,6 @@ extern "C" __global__ void tiled_matmul(
     for (int ell = 0; ell < num_steps; ell++) {
         const int s = ell * r;
 
-        // Load A strip: A[gi, s:s+r] into As[ty, 0:r]
         {
             int total = TM * r;
             for (int idx = tid; idx < total; idx += TM * TN) {
@@ -70,8 +72,6 @@ extern "C" __global__ void tiled_matmul(
                     ? A[grow * k + s + col] : 0;
             }
         }
-
-        // Load B strip: B[s:s+r, gj] into Bs[0:r, tx]
         {
             int total = r * TN;
             for (int idx = tid; idx < total; idx += TM * TN) {
@@ -84,26 +84,21 @@ extern "C" __global__ void tiled_matmul(
 
         __syncthreads();
 
-        // Accumulate via DP4A — process r elements in groups of 4
         const int r4 = r / 4;
         for (int q = 0; q < r4; q++) {
-            int a_pack = 0, b_pack = 0;
-            a_pack |= ((int)As[ty * r + q*4+0] & 0xFF) <<  0;
-            a_pack |= ((int)As[ty * r + q*4+1] & 0xFF) <<  8;
-            a_pack |= ((int)As[ty * r + q*4+2] & 0xFF) << 16;
-            a_pack |= ((int)As[ty * r + q*4+3] & 0xFF) << 24;
-            b_pack |= ((int)Bs[(q*4+0) * TN + tx] & 0xFF) <<  0;
-            b_pack |= ((int)Bs[(q*4+1) * TN + tx] & 0xFF) <<  8;
-            b_pack |= ((int)Bs[(q*4+2) * TN + tx] & 0xFF) << 16;
-            b_pack |= ((int)Bs[(q*4+3) * TN + tx] & 0xFF) << 24;
+            int a_pack = ((int)As[ty * r + q*4+0] & 0xFF)
+                       | ((int)As[ty * r + q*4+1] & 0xFF) << 8
+                       | ((int)As[ty * r + q*4+2] & 0xFF) << 16
+                       | ((int)As[ty * r + q*4+3] & 0xFF) << 24;
+            int b_pack = ((int)Bs[(q*4+0) * TN + tx] & 0xFF)
+                       | ((int)Bs[(q*4+1) * TN + tx] & 0xFF) << 8
+                       | ((int)Bs[(q*4+2) * TN + tx] & 0xFF) << 16
+                       | ((int)Bs[(q*4+3) * TN + tx] & 0xFF) << 24;
             acc = __dp4a(a_pack, b_pack, acc);
         }
-        // Tail if r not multiple of 4 (shouldn't happen with valid r)
-        for (int q = r4 * 4; q < r; q++) {
+        for (int q = r4 * 4; q < r; q++)
             acc += (int32_t)As[ty * r + q] * (int32_t)Bs[q * TN + tx];
-        }
 
-        // --- Warp XOR reduction via butterfly shuffle (sm_75+, ~5 cycles) ---
         uint32_t wx = (uint32_t)acc;
         wx ^= __shfl_xor_sync(0xffffffff, wx, 16);
         wx ^= __shfl_xor_sync(0xffffffff, wx,  8);
@@ -113,21 +108,18 @@ extern "C" __global__ void tiled_matmul(
         if (lane == 0) warp_xors[warp] = wx;
         __syncthreads();
 
-        // Thread 0 combines WARPS_PER_BLOCK warp results and updates M
         if (tid == 0) {
             uint32_t X = 0;
             #pragma unroll
-            for (int w = 0; w < WARPS_PER_BLOCK; w++) X ^= warp_xors[w];
-            int slot = ell & 15;
-            M[slot] = rol32(M[slot], 13) ^ X;
+            for (int w = 0; w < WARPS_PER_BLOCK_DP4A; w++) X ^= warp_xors[w];
+            M[ell & 15] = rol32(M[ell & 15], 13) ^ X;
         }
         __syncthreads();
     }
 
-    // Write C output
-    if (gi < m && gj < n) C[gi * n + gj] = acc;
+    if (tile_i * TM + ty < m && tile_j * TN + tx < n)
+        C[(tile_i * TM + ty) * n + (tile_j * TN + tx)] = acc;
 
-    // Write M state
     if (tid == 0) {
         int num_tiles_n = (n + TN - 1) / TN;
         int base = (tile_i * num_tiles_n + tile_j) * 16;
@@ -135,3 +127,99 @@ extern "C" __global__ void tiled_matmul(
         for (int q = 0; q < 16; q++) M_out[base + q] = M[q];
     }
 }
+
+/* ------------------------------------------------------------------ */
+/*  Kernel B: WMMA INT8 tensor cores (sm_72+, RTX cards)               */
+/* ------------------------------------------------------------------ */
+
+#if __CUDA_ARCH__ >= 720
+
+#include <mma.h>
+using namespace nvcuda::wmma;
+
+extern "C" __global__ void tiled_matmul_wmma(
+    const int8_t* __restrict__ A,
+    const int8_t* __restrict__ B,
+    int32_t*      __restrict__ C,
+    uint32_t*     __restrict__ M_out,
+    int m, int n, int k, int r
+) {
+    const int tile_i = blockIdx.y;
+    const int tile_j = blockIdx.x;
+    const int lane   = threadIdx.x & 31; // one warp per block
+
+    // Skip out-of-bounds tiles
+    if (tile_i * 16 >= m || tile_j * 16 >= n) return;
+
+    // Accumulator fragment (16×16 INT32, persists across depth steps)
+    fragment<accumulator, 16, 16, 16, int32_t> acc;
+    fill_fragment(acc, 0);
+
+    // M state — warp-private, maintained by lane 0
+    uint32_t M[16];
+    #pragma unroll
+    for (int q = 0; q < 16; q++) M[q] = 0;
+
+    const int a_row_start = tile_i * 16;
+    const int b_col_start = tile_j * 16;
+    const int num_steps   = k / r;
+
+    for (int ell = 0; ell < num_steps; ell++) {
+        const int s = ell * r;
+
+        // r/16 sub-steps of WMMA 16×16×16
+        const int sub_steps = r / 16;
+        for (int sub = 0; sub < sub_steps; sub++) {
+            const int depth_off = s + sub * 16;
+
+            fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+            fragment<matrix_b, 16, 16, 16, int8_t, row_major> b_frag;
+
+            // A[tile_i*16 .. tile_i*16+16, depth_off .. depth_off+16]
+            load_matrix_sync(a_frag, A + a_row_start * k + depth_off, k);
+            // B[depth_off .. depth_off+16, tile_j*16 .. tile_j*16+16]
+            load_matrix_sync(b_frag, B + depth_off * n + b_col_start, n);
+
+            mma_sync(acc, a_frag, b_frag, acc);
+        }
+
+        // XOR reduction of accumulator across warp
+        // Each thread holds acc.num_elements (=8) INT32 elements
+        uint32_t local_xor = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            local_xor ^= (uint32_t)acc.x[i];
+
+        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor, 16);
+        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  8);
+        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  4);
+        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  2);
+        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  1);
+
+        if (lane == 0)
+            M[ell & 15] = rol32(M[ell & 15], 13) ^ local_xor;
+
+        __syncwarp();
+    }
+
+    // Store C output
+    store_matrix_sync(C + a_row_start * n + b_col_start, acc, n, mem_row_major);
+
+    // Store M state (lane 0 only)
+    if (lane == 0) {
+        int num_tiles_n = (n + 15) / 16;
+        int base = (tile_i * num_tiles_n + tile_j) * 16;
+        #pragma unroll
+        for (int q = 0; q < 16; q++) M_out[base + q] = M[q];
+    }
+}
+
+#else
+
+// Stub so the PTX always exports the symbol (called only when use_wmma=true
+// which never happens below sm_72)
+extern "C" __global__ void tiled_matmul_wmma(
+    const int8_t*, const int8_t*, int32_t*, uint32_t*,
+    int, int, int, int) {}
+
+#endif

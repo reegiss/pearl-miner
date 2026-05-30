@@ -3,6 +3,7 @@ use pearl_commitment::{compute_challenge, compute_sa};
 use pearl_gpu::GpuMiner;
 use pearl_noise::{apply_e, apply_f, generate_e, generate_f};
 use pearl_types::MiningParams;
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,9 +15,6 @@ const DEFAULT_TM: usize = 16;
 const DEFAULT_TN: usize = 16;
 const DEFAULT_M:  usize = 1024;
 const DEFAULT_N:  usize = 1024;
-
-// Print hashrate every this many seconds
-const LOG_INTERVAL_S: f64 = 5.0;
 
 pub struct Miner {
     gpus: Vec<Arc<GpuMiner>>,
@@ -94,13 +92,27 @@ impl Miner {
             let new_cancel = Arc::new(AtomicBool::new(false));
             cancel = Arc::clone(&new_cancel);
 
+            // Spawn BLAKE3 challenge solver (CPU, rayon parallel)
+            {
+                let cancel_c = Arc::clone(&new_cancel);
+                let submit_c = submit_tx.clone();
+                let seed_c   = seed_hex.clone();
+                handles.push(tokio::task::spawn_blocking(move || {
+                    if let Some(nonce) = solve_blake3_challenge(sigma, difficulty, &cancel_c) {
+                        let nonce_hex = format!("{:016x}", nonce);
+                        println!("[BLAKE3] Challenge solved! nonce={nonce_hex}");
+                        let _ = submit_c.blocking_send(Submit { seed: seed_c, nonce: nonce_hex });
+                    }
+                }));
+            }
+
+            // Spawn PoUW GPU mining threads
             for (gpu_idx, gpu) in self.gpus.iter().enumerate() {
                 let gpu_c    = Arc::clone(gpu);
                 let params_c = Arc::clone(&params);
                 let wallet_c = wallet.clone();
                 let seed_c   = seed_hex.clone();
                 let cancel_c = Arc::clone(&new_cancel);
-                let submit_c = submit_tx.clone();
                 let hashes_c = Arc::clone(&total_hashes);
                 let cc_c     = Arc::clone(&cc);
 
@@ -109,7 +121,7 @@ impl Miner {
                         &gpu_c, &params_c, &wallet_c, &seed_c,
                         gpu_idx, n_gpus,
                         &cc_c,
-                        cancel_c, submit_c, hashes_c,
+                        cancel_c, hashes_c,
                     );
                 }));
             }
@@ -127,7 +139,6 @@ fn mining_loop(
     n_gpus:       usize,
     cc:           &pearl_commitment::ChallengeCommitment,
     cancel:       Arc<AtomicBool>,
-    submit_tx:    mpsc::Sender<Submit>,
     total_hashes: Arc<AtomicU64>,
 ) {
     let tiles_per_job = ((params.m / DEFAULT_TM) * (params.n / DEFAULT_TN)) as u64;
@@ -136,11 +147,11 @@ fn mining_loop(
     let mut last_log   = start;
 
     // Profiling accumulators (µs)
-    let mut t_rand = 0u128;
+    let mut t_rand   = 0u128;
     let mut t_commit = 0u128;
-    let mut t_noise = 0u128;
-    let mut t_apply = 0u128;
-    let mut t_gpu  = 0u128;
+    let mut t_noise  = 0u128;
+    let mut t_apply  = 0u128;
+    let mut t_gpu    = 0u128;
 
     while !cancel.load(Ordering::Relaxed) {
         job += 1;
@@ -166,16 +177,11 @@ fn mining_loop(
         match gpu.mine(&a_prime, params, &s_a) {
             Ok(blocks) if !blocks.is_empty() => {
                 for blk in &blocks {
-                    let nonce = hex_bytes(&blk.hash);
+                    // Log found PoUW tiles — not submitted until proof format is confirmed
                     println!(
-                        "[FOUND] gpu:{gpu_idx} tile=({},{}) nonce={nonce}",
-                        blk.tile_i, blk.tile_j,
+                        "[PoUW] gpu:{gpu_idx} tile=({},{}) hash={} wallet={wallet}",
+                        blk.tile_i, blk.tile_j, hex_bytes(&blk.hash),
                     );
-                    println!("[FOUND] wallet={wallet}");
-                    let _ = submit_tx.blocking_send(Submit {
-                        seed: seed_hex.to_string(),
-                        nonce,
-                    });
                 }
             }
             Ok(_) => {}
@@ -185,29 +191,69 @@ fn mining_loop(
 
         let new_total = total_hashes.fetch_add(tiles_per_job, Ordering::Relaxed) + tiles_per_job;
 
-        // GPU 0 prints combined hashrate + profile breakdown periodically
-        if gpu_idx == 0 {
-            let now = Instant::now();
-            if (now - last_log).as_secs_f64() >= LOG_INTERVAL_S {
-                let elapsed = (now - start).as_secs_f64().max(0.001);
-                let per = |t: u128| t as f64 / job as f64 / 1000.0; // ms per job
-                println!(
-                    "[miner] {} · seed={} · job={}",
-                    fmt_hashrate(new_total as f64 / elapsed),
-                    &seed_hex[..16],
-                    job * n_gpus as u64,
-                );
-                let kernel = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
-                println!(
-                    "[profile/{kernel}] rand={:.2}ms commit={:.2}ms noise={:.2}ms apply={:.2}ms gpu={:.2}ms  total={:.2}ms/job",
-                    per(t_rand), per(t_commit), per(t_noise), per(t_apply), per(t_gpu),
-                    per(t_rand + t_commit + t_noise + t_apply + t_gpu),
-                );
-                last_log = now;
-            }
+        // GPU 0 logs combined hashrate every 100 jobs
+        if gpu_idx == 0 && job % 100 == 0 {
+            let now     = Instant::now();
+            let elapsed = (now - start).as_secs_f64().max(0.001);
+            let per     = |t: u128| t as f64 / job as f64 / 1000.0; // ms/job
+            println!(
+                "[miner] {} · seed={} · job={}",
+                fmt_hashrate(new_total as f64 / elapsed),
+                &seed_hex[..16],
+                job * n_gpus as u64,
+            );
+            let kernel = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
+            println!(
+                "[profile/{kernel}] rand={:.2}ms commit={:.2}ms noise={:.2}ms apply={:.2}ms gpu={:.2}ms  total={:.2}ms/job",
+                per(t_rand), per(t_commit), per(t_noise), per(t_apply), per(t_gpu),
+                per(t_rand + t_commit + t_noise + t_apply + t_gpu),
+            );
+            last_log = now;
         }
+        let _ = last_log; // suppress unused warning
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// BLAKE3 challenge solver
+// ────────────────────────────────────────────────────────────────────────────
+
+fn check_difficulty(hash: &[u8; 32], difficulty: u32) -> bool {
+    // Treat hash as LE uint256; need hash < 2^(256-difficulty)
+    // = top `difficulty` bits (bytes[31..] downward) must be zero
+    let full_bytes = (difficulty / 8) as usize;
+    let remainder  = (difficulty % 8) as u8;
+    for i in 0..full_bytes {
+        if hash[31 - i] != 0 { return false; }
+    }
+    if remainder > 0 {
+        let mask = 0xFF_u8 << (8 - remainder);
+        if hash[31 - full_bytes] & mask != 0 { return false; }
+    }
+    true
+}
+
+fn solve_blake3_challenge(seed: [u8; 32], difficulty: u32, cancel: &AtomicBool) -> Option<u64> {
+    const CHUNK: u64 = 1_000_000;
+    let mut offset = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) { return None; }
+        let result = (offset..offset + CHUNK).into_par_iter().find_any(|&nonce| {
+            if cancel.load(Ordering::Relaxed) { return false; }
+            let mut input = [0u8; 40];
+            input[..32].copy_from_slice(&seed);
+            input[32..].copy_from_slice(&nonce.to_le_bytes());
+            check_difficulty(blake3::hash(&input).as_bytes(), difficulty)
+        });
+        if let Some(nonce) = result { return Some(nonce); }
+        offset += CHUNK;
+        if offset == 0 { return None; } // u64 wrapped
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────────────────
 
 fn random_matrix_i8(rows: usize, cols: usize, seed: u64) -> Vec<i8> {
     let mut x = seed ^ 0xDEAD_BEEF_CAFE_1337;

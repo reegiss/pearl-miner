@@ -1,0 +1,13 @@
+[package]
+name = "pearl-gpu"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+cudarc      = { version = "0.19", features = ["driver", "cuda-12000"] }
+blake3      = "1"
+pearl-types = { path = "../pearl-types" }
+thiserror   = "1"
+
+[build-dependencies]

@@ -346,9 +346,9 @@ extern "C" __global__ void tiled_matmul_wmma(
     const int lane       = threadIdx.x;
     const int tid        = warp_id * 32 + lane;
 
-    const int tile_i     = blockIdx.y * 8 + warp_id;
-    const int tile_j     = blockIdx.x;
-    const bool active    = (tile_i * 16 < m && tile_j * 16 < n);
+    const int tile_i      = blockIdx.y * 8 + warp_id;
+    const int tile_j      = blockIdx.x;
+    const bool active     = (tile_i * 16 < m && tile_j * 16 < n);
     const int  a_row_base = tile_i * 16;
     const int  b_col_base = tile_j * 16;
 
@@ -364,22 +364,38 @@ extern "C" __global__ void tiled_matmul_wmma(
 
     const int num_steps = k / r;
 
+    // Hoist loop-invariant bounds: b_col_base and a_row_base are fixed per block/warp.
+    // b_full_col: all 16 B columns are in-bounds (true for all non-edge N-tiles).
+    // valid_rows: how many A rows are in-bounds for this warp's M-tile.
+    const bool b_full_col = (b_col_base + 15 < n);
+
     for (int ell = 0; ell < num_steps; ell++) {
         const int s = ell * r;
 
-        for (int idx = tid; idx < r * 16; idx += 256) {
-            int row = idx / 16, col = idx % 16;
-            int gcol = b_col_base + col;
-            Bs[row * 16 + col] = ((s + row) < k && gcol < n)
-                ? B[(s + row) * n + gcol] : (int8_t)0;
+        // B-strip load: thread tid loads row `tid` of the r×16 B-strip using a
+        // 128-bit int4 load (16 bytes per thread).  Only `r` threads participate;
+        // s+tid < k is guaranteed because ell < k/r ensures s+r <= k.
+        // B pointer is always 16-byte aligned: B is CUDA-allocated (256-byte
+        // alignment), each row is n bytes (n=1024, multiple of 16), and
+        // b_col_base = tile_j*16 is a multiple of 16.
+        if (tid < r) {
+            if (b_full_col) {
+                *((int4*)(Bs + tid * 16)) =
+                    __ldg((const int4*)(B + (s + tid) * n + b_col_base));
+            } else {
+                for (int c = 0; c < 16; c++)
+                    Bs[tid * 16 + c] = (b_col_base + c < n)
+                        ? __ldg(&B[(s + tid) * n + b_col_base + c]) : (int8_t)0;
+            }
         }
         __syncthreads();
 
         if (active) {
-            // Optimized A-matrix loading: hoist ER noise calculation per column
+            // A-strip: hoist ER noise per column (pos_col/neg_col identical for all rows),
+            // then loop over 16 rows reusing those values — saves 15 splitmix64 calls/col.
             const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
             const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
-            const uint64_t base_el  = (sa_seed ^ 0x200ULL);
+            const uint64_t base_el = (sa_seed ^ 0x200ULL);
 
             for (int c_off = 0; c_off < r; c_off += 32) {
                 int col = c_off + lane;
@@ -398,12 +414,11 @@ extern "C" __global__ void tiled_matmul_wmma(
                     #pragma unroll
                     for (int row = 0; row < 16; row++) {
                         int grow = a_row_base + row;
-                        if (grow < m && global_col < k) {
+                        if (grow < m) {
                             uint64_t row_part = (uint64_t)grow * row_mul;
-                            int8_t a_val = (int8_t)((splitmix64(base_job ^ row_part) & 0x7F) - 64);
+                            int8_t a_val  = (int8_t)((splitmix64(base_job ^ row_part) & 0x7F) - 64);
                             int8_t el_pos = (int8_t)((splitmix64(base_el ^ row_part ^ pos_part) & 0x3F) - 32);
                             int8_t el_neg = (int8_t)((splitmix64(base_el ^ row_part ^ neg_part) & 0x3F) - 32);
-                            
                             int val = (int)a_val + (int)el_pos - (int)el_neg;
                             if (val > 127) val = 127;
                             if (val < -127) val = -127;

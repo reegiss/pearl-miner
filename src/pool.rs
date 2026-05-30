@@ -60,16 +60,17 @@ async fn connect(
     let stream = TcpStream::connect(addr).await?;
     let (reader, mut writer) = stream.into_split();
 
-    let auth = serde_json::json!({
+    // 1. Subscribe
+    let subscribe = serde_json::json!({
         "id": 1,
-        "method": "mining.authorize",
-        "params": [wallet, password]
+        "method": "mining.subscribe",
+        "params": ["pearl-miner/0.1.0"]
     });
-    writer.write_all(format!("{auth}\n").as_bytes()).await?;
-    println!("[pool] Connected. Authenticating...");
+    writer.write_all(format!("{subscribe}\n").as_bytes()).await?;
+    println!("[pool] Connected. Subscribing...");
 
     let mut last_seed  = String::new();
-    let mut msg_id: u64 = 2;
+    let mut msg_id: u64 = 3;
     let mut lines = BufReader::new(reader).lines();
 
     loop {
@@ -86,11 +87,23 @@ async fn connect(
                     continue;
                 };
 
-                // Check for auth response (id 1)
+                // Check for subscribe response (id 1)
                 if msg.id == Some(1) {
+                    println!("[pool] Subscribed. Authorizing...");
+                    let auth = serde_json::json!({
+                        "id": 2,
+                        "method": "mining.authorize",
+                        "params": [wallet, password]
+                    });
+                    writer.write_all(format!("{auth}\n").as_bytes()).await?;
+                    continue;
+                }
+
+                // Check for auth response (id 2)
+                if msg.id == Some(2) {
                     if let Some(res) = msg.result {
                         if res.as_bool() == Some(true) {
-                            println!("[pool] Authentication successful!");
+                            println!("[pool] Authentication successful! Worker is now active.");
                         } else {
                             println!("[pool] Authentication FAILED: {:?}", res);
                         }

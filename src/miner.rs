@@ -157,10 +157,17 @@ fn mining_loop(
 
         // GPU: tiled matmul A'·B', M-state accumulation, BLAKE3 difficulty check
         // A' is generated on-the-fly in the MatMul kernels (PRNG fusion)
-        let [t_kernel, t_dtoh, _] = match gpu.mine(params, job_seed, &virtual_sa) {
-            Ok((blocks, timing)) => { let _ = blocks; timing }
+        let ([t_kernel, t_dtoh, _], found_blocks) = match gpu.mine(params, job_seed, &virtual_sa) {
+            Ok((blocks, timing)) => (timing, blocks),
             Err(e) => { eprintln!("[gpu:{gpu_idx}] mine error: {e}"); break; }
         };
+
+        for fb in found_blocks {
+            let nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
+            println!("[PoUW] Found block! hash={}", &nonce_hex[..16]);
+            let _ = submit_tx.blocking_send(Submit { seed: cc.seed.clone(), nonce: nonce_hex });
+        }
+
         let _ = wallet;
         let _ = t0;
         t_kernel_acc  += t_kernel;

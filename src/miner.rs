@@ -306,8 +306,3 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-

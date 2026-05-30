@@ -158,17 +158,21 @@ fn mining_loop(
 
         let t0 = Instant::now();
 
-        // GPU: tiled matmul A'·B', M-state accumulation, BLAKE3 difficulty check
-        // A' is generated on-the-fly in the MatMul kernels (PRNG fusion)
-        let ([t_kernel, t_dtoh, _], found_blocks) = match gpu.mine(params, job_seed, &virtual_sa) {
-            Ok((blocks, timing)) => (timing, blocks),
+        // GPU: tiled matmul A'·B', M-state accumulation, BLAKE3 difficulty check, pool solver
+        let (found_blocks, best_nonce, best_hash, [t_kernel, t_dtoh, _]) = match gpu.mine(params, job_seed, &virtual_sa) {
+            Ok(res) => res,
             Err(e) => { eprintln!("[gpu:{gpu_idx}] mine error: {e}"); break; }
         };
 
-        for fb in found_blocks {
-            let _nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
+        for _fb in found_blocks {
             // PoUW blocks are NOT shares for this pool.
-            // Sending them causes "Connection closed by server".
+        }
+
+        // Check if the GPU found a share for the pool
+        if check_difficulty(&best_hash, params.difficulty) {
+            let nonce_hex = format!("{:016x}", best_nonce);
+            let seed_hex: String = params.sigma.iter().map(|b| format!("{:02x}", b)).collect();
+            let _ = submit_tx.blocking_send(Submit { seed: seed_hex, nonce: nonce_hex });
         }
 
         let _ = wallet;

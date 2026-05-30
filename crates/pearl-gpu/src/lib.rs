@@ -59,6 +59,7 @@ pub struct GpuMiner {
     func_wmma:      CudaFunction,
     func_blake3:    CudaFunction,
     func_gen_a:     CudaFunction,
+    func_solve_pool: CudaFunction,
     use_wmma:       bool,
     d_a:           Mutex<CudaSlice<i8>>,   // A' (m×k) — regenerated each job
     d_b:           Mutex<CudaSlice<i8>>,   // B' (k×n) — set once per challenge
@@ -68,6 +69,8 @@ pub struct GpuMiner {
     d_threshold:   Mutex<CudaSlice<u32>>,  // difficulty threshold as 8 u32 words
     d_found:       Mutex<CudaSlice<u32>>,  // found tiles: MAX_FOUND × FOUND_STRIDE
     d_found_count: Mutex<CudaSlice<u32>>,  // atomic counter (1 u32)
+    d_best_nonce:  Mutex<CudaSlice<u32>>,  // u64 best nonce (2 words)
+    d_best_hash:   Mutex<CudaSlice<u32>>,  // u256 best hash (8 words)
     m: usize, n: usize, k: usize, r: usize,
     num_tiles_m: usize, num_tiles_n: usize,
     pub info: GpuInfo,
@@ -88,6 +91,7 @@ impl GpuMiner {
         let func_wmma      = module.load_function("tiled_matmul_wmma")?;
         let func_blake3    = module.load_function("blake3_check")?;
         let func_gen_a     = module.load_function("generate_a_prime")?;
+        let func_solve_pool = module.load_function("solve_blake3_pool")?;
         let use_wmma       = sm >= 72;
 
         let (m, n, k, r) = (params.m, params.n, params.k, params.r);
@@ -103,11 +107,14 @@ impl GpuMiner {
         let d_threshold   = Mutex::new(stream.alloc_zeros::<u32>(8)?);
         let d_found       = Mutex::new(stream.alloc_zeros::<u32>(MAX_FOUND * FOUND_STRIDE)?);
         let d_found_count = Mutex::new(stream.alloc_zeros::<u32>(1)?);
+        let d_best_nonce  = Mutex::new(stream.alloc_zeros::<u32>(2)?);
+        let d_best_hash   = Mutex::new(stream.alloc_zeros::<u32>(8)?);
 
         Ok(Self {
             ctx, stream, module,
-            func_dp4a, func_wmma, func_blake3, func_gen_a, use_wmma,
+            func_dp4a, func_wmma, func_blake3, func_gen_a, func_solve_pool, use_wmma,
             d_a, d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
+            d_best_nonce, d_best_hash,
             m, n, k, r, num_tiles_m, num_tiles_n,
             info: GpuInfo { name, mem_mb, use_wmma, sm },
         })
@@ -119,13 +126,14 @@ impl GpuMiner {
         Ok(())
     }
 
-    /// Run matmul + GPU-side BLAKE3 difficulty check. Returns found blocks and stage timings.
+    /// Run matmul + GPU-side BLAKE3 difficulty check + pool challenge solver.
+    /// Returns found blocks, best challenge nonce, best challenge hash, and stage timings.
     pub fn mine(
         &self,
         params:   &MiningParams,
         job_seed: u64,
         s_a:      &[u8; 32],
-    ) -> Result<(Vec<FoundBlock>, [u128; 3]), GpuError> {
+    ) -> Result<(Vec<FoundBlock>, u64, [u8; 32], [u128; 3]), GpuError> {
         let (m, n, k, r)     = (self.m, self.n, self.k, self.r);
         let (ntm, ntn)       = (self.num_tiles_m, self.num_tiles_n);
         let (mi, ni, ki, ri) = (m as i32, n as i32, k as i32, r as i32);
@@ -147,9 +155,13 @@ impl GpuMiner {
             .collect();
         self.stream.memcpy_htod(&thresh_words, &mut *self.d_threshold.lock().unwrap())?;
 
-        // Reset found counter to 0
-        let zero = [0u32; 1];
-        self.stream.memcpy_htod(&zero, &mut *self.d_found_count.lock().unwrap())?;
+        // Reset counters/buffers
+        {
+            let zero = [0u32; 1];
+            self.stream.memcpy_htod(&zero, &mut *self.d_found_count.lock().unwrap())?;
+            let max_hash = [u32::MAX; 8];
+            self.stream.memcpy_htod(&max_hash, &mut *self.d_best_hash.lock().unwrap())?;
+        }
 
         // Lock all buffers
         let mut d_a = self.d_a.lock().unwrap();
@@ -160,6 +172,8 @@ impl GpuMiner {
         let d_thr = self.d_threshold.lock().unwrap();
         let mut d_found       = self.d_found.lock().unwrap();
         let mut d_found_count = self.d_found_count.lock().unwrap();
+        let mut d_best_nonce  = self.d_best_nonce.lock().unwrap();
+        let mut d_best_hash   = self.d_best_hash.lock().unwrap();
 
         // --- Matmul kernel ---
         let t_kernel_start = std::time::Instant::now();
@@ -225,18 +239,38 @@ impl GpuMiner {
             unsafe { b.launch(cfg) }?;
         }
 
+        // --- Stage 3: Pool challenge solver (burst) ---
+        {
+            let threads = 1024u32;
+            let blocks  = 64u32; // 64k nonces per job
+            let base_nonce = job_seed * 65536; 
+            let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            let mut b = self.stream.launch_builder(&self.func_solve_pool);
+            b.arg(&*d_sa);
+            b.arg(&base_nonce);
+            b.arg(&mut *d_best_nonce);
+            b.arg(&mut *d_best_hash);
+            unsafe { b.launch(cfg) }?;
+        }
+
         self.stream.synchronize()?;
         let t_kernel = t_kernel_start.elapsed().as_micros();
 
-        // --- D2H: only the count + winning tiles (bytes, not megabytes) ---
+        // --- D2H results ---
         let t_dtoh_start = std::time::Instant::now();
         let count_vec = self.stream.clone_dtoh(&*d_found_count)?;
         let count = (count_vec[0] as usize).min(MAX_FOUND);
-        let found_flat = if count > 0 {
-            self.stream.clone_dtoh(&*d_found)?
-        } else {
-            vec![]
-        };
+        let found_flat = if count > 0 { self.stream.clone_dtoh(&*d_found)? } else { vec![] };
+        
+        let best_nonce_words = self.stream.clone_dtoh(&*d_best_nonce)?;
+        let best_nonce = (best_nonce_words[0] as u64) | ((best_nonce_words[1] as u64) << 32);
+        
+        let best_hash_words = self.stream.clone_dtoh(&*d_best_hash)?;
+        let mut best_hash = [0u8; 32];
+        for (i, &w) in best_hash_words.iter().enumerate() {
+            best_hash[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
+        }
+
         let t_dtoh = t_dtoh_start.elapsed().as_micros();
 
         // Decode found entries
@@ -253,7 +287,7 @@ impl GpuMiner {
             FoundBlock { tile_i, tile_j, m_state, hash }
         }).collect();
 
-        Ok((found, [t_kernel, t_dtoh, 0]))
+        Ok((found, best_nonce, best_hash, [t_kernel, t_dtoh, 0]))
     }
 }
 

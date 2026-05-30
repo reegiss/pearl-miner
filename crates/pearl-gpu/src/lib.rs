@@ -55,12 +55,12 @@ pub struct GpuMiner {
     stream:       Arc<CudaStream>,
     #[allow(dead_code)]
     module:       Arc<CudaModule>,
-    func_dp4a:    CudaFunction,
-    func_wmma:    CudaFunction,
-    func_blake3:  CudaFunction,
-    func_gen_a:   CudaFunction,
-    use_wmma:     bool,
-    d_a:           Mutex<CudaSlice<i8>>,   // A' (m×k) — regenerated each job on GPU
+    func_dp4a:      CudaFunction,
+    func_wmma:      CudaFunction,
+    func_blake3:    CudaFunction,
+    func_noise_gen: CudaFunction,
+    use_wmma:       bool,
+    d_el:          Mutex<CudaSlice<i8>>,   // EL noise factor (m×r, 128KB) — regenerated each job
     d_b:           Mutex<CudaSlice<i8>>,   // B' (k×n) — set once per challenge
     d_c:           Mutex<CudaSlice<i32>>,  // placeholder (kernel never writes C)
     d_m:           Mutex<CudaSlice<u32>>,  // M states (num_tiles×16)
@@ -84,18 +84,18 @@ impl GpuMiner {
         let stream = ctx.default_stream();
         let module = ctx.load_module(Ptx::from_src(best_ptx(sm)))?;
 
-        let func_dp4a   = module.load_function("tiled_matmul_dp4a")?;
-        let func_wmma   = module.load_function("tiled_matmul_wmma")?;
-        let func_blake3 = module.load_function("blake3_check")?;
-        let func_gen_a  = module.load_function("generate_a_prime")?;
-        let use_wmma    = sm >= 72;
+        let func_dp4a      = module.load_function("tiled_matmul_dp4a")?;
+        let func_wmma      = module.load_function("tiled_matmul_wmma")?;
+        let func_blake3    = module.load_function("blake3_check")?;
+        let func_noise_gen = module.load_function("generate_noise_factors")?;
+        let use_wmma       = sm >= 72;
 
         let (m, n, k, r) = (params.m, params.n, params.k, params.r);
         let num_tiles_m  = (m + TM - 1) / TM;
         let num_tiles_n  = (n + TN - 1) / TN;
         let num_tiles    = num_tiles_m * num_tiles_n;
 
-        let d_a           = Mutex::new(stream.alloc_zeros::<i8>(m * k)?);
+        let d_el          = Mutex::new(stream.alloc_zeros::<i8>(m * r)?);
         let d_b           = Mutex::new(stream.alloc_zeros::<i8>(k * n)?);
         let d_c           = Mutex::new(stream.alloc_zeros::<i32>(1)?);
         let d_m           = Mutex::new(stream.alloc_zeros::<u32>(num_tiles * 16)?);
@@ -106,8 +106,8 @@ impl GpuMiner {
 
         Ok(Self {
             ctx, stream, module,
-            func_dp4a, func_wmma, func_blake3, func_gen_a, use_wmma,
-            d_a, d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
+            func_dp4a, func_wmma, func_blake3, func_noise_gen, use_wmma,
+            d_el, d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
             m, n, k, r, num_tiles_m, num_tiles_n,
             info: GpuInfo { name, mem_mb, use_wmma, sm },
         })

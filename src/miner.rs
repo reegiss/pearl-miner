@@ -168,9 +168,9 @@ fn mining_loop(
 
         for fb in found_blocks {
             let nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
-            let seed_hex: String = params.sigma.iter().map(|b| format!("{:02x}", b)).collect();
             println!("[PoUW] Found block! hash={}", &nonce_hex[..16]);
-            let _ = submit_tx.blocking_send(Submit { seed: seed_hex, nonce: nonce_hex });
+            // NOTE: Do not submit PoUW blocks to pearl.challenge_response.
+            // That method is for BLAKE3 challenge nonces only.
         }
 
         let _ = wallet;

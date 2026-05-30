@@ -2,7 +2,9 @@ mod miner;
 mod pool;
 
 use clap::Parser;
+use pearl_gpu::GpuMiner;
 use pearl_types::MiningParams;
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser)]
@@ -52,7 +54,19 @@ async fn main() {
         }
     };
 
-    // challenge_tx carries (seed_hex, difficulty, job_id)
+    // GPU 0 is shared with pool for BLAKE3 challenge solving
+    let pool_gpu = match GpuMiner::new(device_ids[0], &pearl_types::MiningParams {
+        sigma: [0u8; 32], difficulty: 32,
+        r: 256, k: 4096, tm: 16, tn: 16, m: 8192, n: 8192,
+    }) {
+        Ok(g) => Arc::new(g),
+        Err(e) => {
+            eprintln!("Failed to init pool GPU: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // challenge_tx carries (sigma_hex, pouw_difficulty, job_id) from mining.notify
     let (challenge_tx, challenge_rx) = watch::channel(None::<(String, u32, String)>);
     // params_tx carries pool-assigned matrix dimensions
     let (params_tx, params_rx)       = watch::channel(None::<MiningParams>);
@@ -61,8 +75,9 @@ async fn main() {
     let pool_addr   = args.pool.clone();
     let pool_wallet = args.wallet.clone();
     let pool_pass   = args.password.clone();
+    let n_gpus = device_ids.len();
     tokio::spawn(async move {
-        pool::run(&pool_addr, &pool_wallet, &pool_pass, challenge_tx, params_tx, submit_rx).await;
+        pool::run(&pool_addr, &pool_wallet, &pool_pass, n_gpus, pool_gpu, challenge_tx, params_tx, submit_rx).await;
     });
 
     miner.run(args.wallet, challenge_rx, params_rx, submit_tx).await;

@@ -41,6 +41,8 @@ __constant__ uint32_t BLAKE3_IV[8] = {
 
 // flags: CHUNK_START|CHUNK_END|ROOT|KEYED_HASH = 1|2|8|16 = 27
 #define BLAKE3_DOMAIN 27u
+// flags: CHUNK_START|CHUNK_END|ROOT (unkeyed single chunk)
+#define BLAKE3_FLAGS_UNKEYED 11u
 
 __constant__ uint8_t BLAKE3_MSG_SCHED[7][16] = {
     { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15},
@@ -642,6 +644,87 @@ extern "C" __global__ void solve_blake3_pool(
             d_best_nonce_out[1] = (uint32_t)(best_n >> 32);
             #pragma unroll
             for (int i = 0; i < 7; i++) d_best_hash_out[i] = hash[i];
+        }
+    }
+}
+
+// ─── Pool challenge solver — standard (unkeyed) BLAKE3 ──────────────────────
+// Computes BLAKE3(seed_32bytes ++ nonce_8bytes_le) and checks for leading zero
+// bits. hash[0] word == first 4 output bytes in little-endian; difficulty=32
+// means hash[0] must be 0. If a solution is found, stores nonce atomically.
+extern "C" __global__ void solve_pool_challenge(
+    const uint32_t* __restrict__ d_seed,    // 32-byte seed as 8 u32 LE words
+    uint64_t                     base_nonce,
+    uint32_t                     difficulty, // required leading zero bits (e.g. 32)
+    uint32_t*       __restrict__ d_nonce,   // output: found nonce as 2 u32 LE
+    uint32_t*       __restrict__ d_found    // output: 1 if any nonce found, else 0
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t nonce = base_nonce + (uint64_t)tid;
+
+    // 64-byte message block: 32 seed bytes + 8 nonce bytes + 24 zero padding
+    uint32_t m[16];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) m[i] = d_seed[i];
+    m[8]  = (uint32_t)(nonce & 0xFFFFFFFFu);
+    m[9]  = (uint32_t)(nonce >> 32);
+    #pragma unroll
+    for (int i = 10; i < 16; i++) m[i] = 0;
+
+    // Standard BLAKE3 compression — unkeyed single-chunk (40-byte input)
+    uint32_t v[16];
+    // Chain state = BLAKE3_IV (not key), IV constants, counter=0, len=40, flags=11
+    #pragma unroll
+    for (int i = 0; i < 8; i++) v[i]     = BLAKE3_IV[i];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) v[8 + i] = BLAKE3_IV[i];
+    v[12] = 0; v[13] = 0; v[14] = 40; v[15] = BLAKE3_FLAGS_UNKEYED;
+
+    #pragma unroll
+    for (int r = 0; r < 7; r++) {
+        const uint8_t* s = BLAKE3_MSG_SCHED[r];
+        blake3_g(v, 0, 4,  8, 12, m[s[ 0]], m[s[ 1]]);
+        blake3_g(v, 1, 5,  9, 13, m[s[ 2]], m[s[ 3]]);
+        blake3_g(v, 2, 6, 10, 14, m[s[ 4]], m[s[ 5]]);
+        blake3_g(v, 3, 7, 11, 15, m[s[ 6]], m[s[ 7]]);
+        blake3_g(v, 0, 5, 10, 15, m[s[ 8]], m[s[ 9]]);
+        blake3_g(v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+        blake3_g(v, 2, 7,  8, 13, m[s[12]], m[s[13]]);
+        blake3_g(v, 3, 4,  9, 14, m[s[14]], m[s[15]]);
+    }
+
+    uint32_t hash[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) hash[i] = v[i] ^ v[i + 8];
+
+    // Check leading zero bits.
+    // hash[i] (LE word) = output bytes [i*4 .. i*4+4].
+    // difficulty=32 → hash[0]==0 (first 4 output bytes are 0).
+    uint32_t full_words = difficulty >> 5;       // difficulty / 32
+    uint32_t rem_bits   = difficulty & 31u;      // difficulty % 32
+
+    bool meets = true;
+    for (uint32_t i = 0; i < full_words && meets; i++) {
+        if (hash[i] != 0u) meets = false;
+    }
+    if (meets && rem_bits > 0u) {
+        // Need top rem_bits of hash[full_words] (in output byte order) to be 0.
+        // hash[] is little-endian word storage; byte 0 of word = LSByte.
+        // Byteswap to get big-endian so we can mask the top rem_bits.
+        uint32_t hw = hash[full_words];
+        uint32_t w  = ((hw & 0xFF000000u) >> 24)
+                    | ((hw & 0x00FF0000u) >>  8)
+                    | ((hw & 0x0000FF00u) <<  8)
+                    | ((hw & 0x000000FFu) << 24);
+        uint32_t mask = ~(0xFFFFFFFFu >> rem_bits);
+        if (w & mask) meets = false;
+    }
+
+    if (meets) {
+        // First thread to find a solution wins
+        if (atomicCAS(d_found, 0u, 1u) == 0u) {
+            d_nonce[0] = (uint32_t)(nonce & 0xFFFFFFFFu);
+            d_nonce[1] = (uint32_t)(nonce >> 32);
         }
     }
 }

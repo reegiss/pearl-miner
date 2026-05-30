@@ -303,6 +303,69 @@ impl GpuMiner {
 
         Ok((found, best_nonce, best_hash, [t_kernel, t_dtoh, 0]))
     }
+
+    /// Solve the Stratum pool BLAKE3 challenge on GPU.
+    /// Computes BLAKE3(seed_32 ++ nonce_le_8) and looks for a nonce where
+    /// the hash has at least `difficulty` leading zero bits.
+    /// Returns Some(nonce) on success or None if cancelled.
+    pub fn solve_pool_challenge(
+        &self,
+        seed:       &[u8; 32],
+        difficulty: u32,
+        cancel:     &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<u64>, GpuError> {
+        use std::sync::atomic::Ordering;
+
+        let func = self.module.load_function("solve_pool_challenge")?;
+
+        // Upload seed
+        let seed_words: Vec<u32> = seed.chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let mut d_seed = self.stream.alloc_zeros::<u32>(8)?;
+        self.stream.memcpy_htod(&seed_words, &mut d_seed)?;
+
+        // Allocate output buffers
+        let mut d_nonce = self.stream.alloc_zeros::<u32>(2)?;
+        let mut d_found = self.stream.alloc_zeros::<u32>(1)?;
+
+        // 64 blocks × 1024 threads = 65 536 nonces per kernel launch
+        const THREADS: u32 = 1024;
+        const BLOCKS:  u32 = 64;
+        const PER_LAUNCH: u64 = THREADS as u64 * BLOCKS as u64;
+
+        let mut base_nonce: u64 = 0;
+        loop {
+            if cancel.load(Ordering::Relaxed) { return Ok(None); }
+
+            // Reset found flag
+            self.stream.memcpy_htod(&[0u32], &mut d_found)?;
+
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (BLOCKS, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = self.stream.launch_builder(&func);
+            b.arg(&d_seed);
+            b.arg(&base_nonce);
+            b.arg(&difficulty);
+            b.arg(&mut d_nonce);
+            b.arg(&mut d_found);
+            unsafe { b.launch(cfg) }?;
+            self.stream.synchronize()?;
+
+            let found_flag = self.stream.clone_dtoh(&d_found)?;
+            if found_flag[0] != 0 {
+                let nonce_words = self.stream.clone_dtoh(&d_nonce)?;
+                let nonce = (nonce_words[0] as u64) | ((nonce_words[1] as u64) << 32);
+                return Ok(Some(nonce));
+            }
+
+            base_nonce = base_nonce.wrapping_add(PER_LAUNCH);
+            if base_nonce == 0 { return Ok(None); } // exhausted 64-bit space
+        }
+    }
 }
 
 

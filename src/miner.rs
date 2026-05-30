@@ -3,7 +3,6 @@ use pearl_commitment::compute_challenge;
 use pearl_gpu::GpuMiner;
 use pearl_noise::{apply_f, generate_f};
 use pearl_types::MiningParams;
-use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -99,25 +98,6 @@ impl Miner {
             let new_cancel = Arc::new(AtomicBool::new(false));
             cancel = Arc::clone(&new_cancel);
 
-            // BLAKE3 challenge solver (CPU, rayon parallel)
-            {
-                let cancel_c = Arc::clone(&new_cancel);
-                let submit_c = submit_tx.clone();
-                let seed_c   = seed_hex.clone();
-                let job_c    = job_id.clone();
-                handles.push(tokio::task::spawn_blocking(move || {
-                    if let Some(nonce) = solve_blake3_challenge(sigma, difficulty, &cancel_c) {
-                        let nonce_hex = format!("{:016x}", nonce);
-                        println!("[miner] BLAKE3 solved: nonce={nonce_hex} diff={difficulty}");
-                        let _ = submit_c.blocking_send(Submit {
-                            seed:   seed_c,
-                            nonce:  nonce_hex,
-                            job_id: job_c,
-                        });
-                    }
-                }));
-            }
-
             // PoUW GPU mining threads
             for (gpu_idx, gpu) in self.gpus.iter().enumerate() {
                 let gpu_c    = Arc::clone(gpu);
@@ -211,43 +191,6 @@ fn mining_loop(
                 last_log = now;
             }
         }
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// BLAKE3 challenge solver
-// ────────────────────────────────────────────────────────────────────────────
-
-fn check_difficulty(hash: &[u8; 32], difficulty: u32) -> bool {
-    let full_bytes = (difficulty / 8) as usize;
-    let remainder  = (difficulty % 8) as u8;
-    for i in 0..full_bytes {
-        if hash[31 - i] != 0 { return false; }
-    }
-    if remainder > 0 {
-        let mask = 0xFF_u8 << (8 - remainder);
-        if hash[31 - full_bytes] & mask != 0 { return false; }
-    }
-    true
-}
-
-fn solve_blake3_challenge(seed: [u8; 32], difficulty: u32, cancel: &AtomicBool) -> Option<u64> {
-    // Use the global rayon pool (all available threads, no overhead of pool creation).
-    // GPU mining no longer uses CPU rayon for noise, so all cores are free for this.
-    const CHUNK: u64 = 4_000_000;
-    let mut offset = 0u64;
-    loop {
-        if cancel.load(Ordering::Relaxed) { return None; }
-        let result = (offset..offset + CHUNK).into_par_iter().find_any(|&nonce| {
-            if cancel.load(Ordering::Relaxed) { return false; }
-            let mut input = [0u8; 40];
-            input[..32].copy_from_slice(&seed);
-            input[32..].copy_from_slice(&nonce.to_le_bytes());
-            check_difficulty(blake3::hash(&input).as_bytes(), difficulty)
-        });
-        if let Some(nonce) = result { return Some(nonce); }
-        offset += CHUNK;
-        if offset == 0 { return None; }
     }
 }
 

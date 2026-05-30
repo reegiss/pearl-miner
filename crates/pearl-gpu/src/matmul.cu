@@ -415,8 +415,14 @@ void tiled_matmul_wmma(
     int8_t* wAs = Bs + r * 16 + warp_id * 16 * r;
 #endif
 
+#if __CUDA_ARCH__ >= 800
+    fragment<accumulator, 16, 8, 32, int32_t> acc_l, acc_r;
+    fill_fragment(acc_l, 0);
+    fill_fragment(acc_r, 0);
+#else
     fragment<accumulator, 16, 16, 16, int32_t> acc;
     fill_fragment(acc, 0);
+#endif
 
     uint32_t M[16];
     #pragma unroll
@@ -469,18 +475,23 @@ void tiled_matmul_wmma(
             fill_wAs(wAs, EL, job_seed, sa_seed, a_row_base, s, m, r, lane);
             __syncwarp();
 
-            const int sub_steps = r / 16;
+            const int sub_steps = r / 32;
             for (int sub = 0; sub < sub_steps; sub++) {
-                fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
-                fragment<matrix_b, 16, 16, 16, int8_t, row_major> b_frag;
-                load_matrix_sync(a_frag, wAs     + sub * 16,       r);
-                load_matrix_sync(b_frag, Bs_cur  + sub * 16 * 16, 16);
-                mma_sync(acc, a_frag, b_frag, acc);
+                fragment<matrix_a, 16, 8, 32, int8_t, row_major> a_frag;
+                fragment<matrix_b, 16, 8, 32, int8_t, row_major> b_frag_l, b_frag_r;
+                load_matrix_sync(a_frag, wAs     + sub * 32,       r);
+                load_matrix_sync(b_frag_l, Bs_cur  + sub * 32 * 16,     16);
+                load_matrix_sync(b_frag_r, Bs_cur  + sub * 32 * 16 + 8, 16);
+                mma_sync(acc_l, a_frag, b_frag_l, acc_l);
+                mma_sync(acc_r, a_frag, b_frag_r, acc_r);
             }
 
             uint32_t local_xor = 0;
             #pragma unroll
-            for (int i = 0; i < 8; i++) local_xor ^= (uint32_t)acc.x[i];
+            for (int i = 0; i < 4; i++) {
+                local_xor ^= (uint32_t)acc_l.x[i];
+                local_xor ^= (uint32_t)acc_r.x[i];
+            }
             local_xor ^= __shfl_xor_sync(0xffffffff, local_xor, 16);
             local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  8);
             local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  4);

@@ -85,11 +85,13 @@ impl GpuMiner {
         let (mi, ni, ki, ri) = (m as i32, n as i32, k as i32, r as i32);
 
         if self.use_wmma {
-            // WMMA: 1 warp (32 threads) per tile, no shared memory needed
+            // WMMA: 1 warp (32 threads) per tile
+            // Shared memory: As[16×r] + Bs[r×16] for coalesced staging
+            let smem = (2 * 16 * r) as u32;
             let cfg = LaunchConfig {
                 grid_dim:         (num_tiles_n as u32, num_tiles_m as u32, 1),
                 block_dim:        (32, 1, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes: smem,
             };
             let mut b = self.stream.launch_builder(&self.func_wmma);
             b.arg(&d_a); b.arg(&d_b); b.arg(&mut d_c); b.arg(&mut d_m);

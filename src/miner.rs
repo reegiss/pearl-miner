@@ -187,8 +187,9 @@ fn mining_loop(
                     &seed_hex[..16],
                     job * n_gpus as u64,
                 );
+                let kernel = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
                 println!(
-                    "[profile] rand={:.2}ms commit={:.2}ms noise={:.2}ms apply={:.2}ms gpu={:.2}ms  total={:.2}ms/job",
+                    "[profile/{kernel}] rand={:.2}ms commit={:.2}ms noise={:.2}ms apply={:.2}ms gpu={:.2}ms  total={:.2}ms/job",
                     per(t_rand), per(t_commit), per(t_noise), per(t_apply), per(t_gpu),
                     per(t_rand + t_commit + t_noise + t_apply + t_gpu),
                 );

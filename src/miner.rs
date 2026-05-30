@@ -41,7 +41,7 @@ impl Miner {
         self,
         wallet:           String,
         mut challenge_rx: watch::Receiver<Option<(String, u32, String)>>,
-        mut params_rx:    watch::Receiver<Option<MiningParams>>,
+        params_rx:        watch::Receiver<Option<MiningParams>>,
         submit_tx:        mpsc::Sender<Submit>,
     ) {
         let n_gpus = self.gpus.len();

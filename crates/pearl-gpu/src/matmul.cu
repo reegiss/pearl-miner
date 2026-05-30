@@ -206,30 +206,6 @@ extern "C" __global__ void generate_a_prime(
     if (val < -127) val = -127;
     A_prime[row * k + col] = (int8_t)val;
 }
-    }
-    __syncthreads();
-
-    if (row >= m || col >= k) return;
-
-    // Compute ER positions for this column
-    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ ((uint64_t)col * col_mul));
-    int pos_col = (int)(er_s & (r - 1));
-    er_s = splitmix64(er_s);
-    int neg_col = (int)(er_s & (r - 1));
-    if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
-
-    // Compute A
-    int8_t a_val = (int8_t)((splitmix64(job_seed ^ ((uint64_t)row * row_mul) ^ ((uint64_t)col * col_mul)) & 0x7F) - 64);
-    
-    int val = (int)a_val + (int)EL_sh[threadIdx.y * r + pos_col] - (int)EL_sh[threadIdx.y * r + neg_col];
-    if (val > 127) val = 127;
-    if (val < -127) val = -127;
-    A_prime[row * k + col] = (int8_t)val;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Kernel A: DP4A (CUDA cores, sm_61+)                                */
-/* ------------------------------------------------------------------ */
 
 extern "C" __global__ void tiled_matmul_dp4a(
     const int8_t* __restrict__ A,

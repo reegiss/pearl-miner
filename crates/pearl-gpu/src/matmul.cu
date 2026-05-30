@@ -198,37 +198,37 @@ using namespace nvcuda::wmma;
 extern "C" __global__ void tiled_matmul_wmma(
     const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
-    int32_t*      __restrict__ C,
+    int32_t*      __restrict__ C,   // unused — kept for ABI compatibility
     uint32_t*     __restrict__ M_out,
     int m, int n, int k, int r
 ) {
     /*
-     * 4 warps per block; each warp handles one 16×16 output tile.
-     * blockDim = (32, 4, 1) → 128 threads = 4 warps
-     * gridDim  = (n/16, (m+63)/64, 1)
+     * 8 warps per block; each warp handles one 16×16 output tile.
+     * blockDim = (32, 8, 1) → 256 threads = 8 warps
+     * gridDim  = (n/16, (m+127)/128, 1)
      *
-     * Shared memory per block (5 × r × 16 bytes):
-     *   Bs[r × 16]          — B strip for this tile column (all 4 warps share)
-     *   As_w[4][16 × r]     — A strip per warp (each warp writes its own section)
+     * Shared memory per block (9 × r × 16 bytes):
+     *   Bs[r × 16]          — B strip shared by all 8 warps (loaded once)
+     *   As_w[8][16 × r]     — A strip per warp
      *
-     * This layout gives 3-4× more warps/SM than the old 1-warp design,
-     * boosting SM occupancy from ~33% to ~100%.
+     * 8 warps share one Bs load: 2× fewer B global reads vs 4-warp layout.
+     * C is never written — only M_out matters for the PoUW proof.
      */
     extern __shared__ int32_t smem_wmma[];
 
-    const int warp_id    = threadIdx.y;   // 0..3
+    const int warp_id    = threadIdx.y;   // 0..7
     const int lane       = threadIdx.x;   // 0..31
     const int tid        = warp_id * 32 + lane;
 
-    const int tile_i     = blockIdx.y * 4 + warp_id;
+    const int tile_i     = blockIdx.y * 8 + warp_id;
     const int tile_j     = blockIdx.x;
     const bool active    = (tile_i * 16 < m && tile_j * 16 < n);
     const int  a_row_base = tile_i * 16;
     const int  b_col_base = tile_j * 16;
 
-    // Shared memory pointers
-    int8_t* Bs   = (int8_t*)smem_wmma;
-    int8_t* wAs  = Bs + r * 16 + warp_id * 16 * r;
+    // Shared memory layout: Bs[r×16], then 8 × As[16×r]
+    int8_t* Bs  = (int8_t*)smem_wmma;
+    int8_t* wAs = Bs + r * 16 + warp_id * 16 * r;
 
     fragment<accumulator, 16, 16, 16, int32_t> acc;
     fill_fragment(acc, 0);
@@ -242,8 +242,8 @@ extern "C" __global__ void tiled_matmul_wmma(
     for (int ell = 0; ell < num_steps; ell++) {
         const int s = ell * r;
 
-        // All 128 threads cooperatively load Bs[r × 16]
-        for (int idx = tid; idx < r * 16; idx += 128) {
+        // All 256 threads cooperatively load Bs[r × 16]
+        for (int idx = tid; idx < r * 16; idx += 256) {
             int row = idx / 16, col = idx % 16;
             int gcol = b_col_base + col;
             Bs[row * 16 + col] = ((s + row) < k && gcol < n)
@@ -262,7 +262,7 @@ extern "C" __global__ void tiled_matmul_wmma(
         }
         __syncwarp();
 
-        // WMMA sub-steps
+        // WMMA sub-steps + per-tile M-state XOR (warp-private, no inter-warp sync)
         if (active) {
             const int sub_steps = r / 16;
             for (int sub = 0; sub < sub_steps; sub++) {
@@ -290,7 +290,7 @@ extern "C" __global__ void tiled_matmul_wmma(
 
     if (!active) return;
 
-    store_matrix_sync(C + a_row_base * n + b_col_base, acc, n, mem_row_major);
+    // C write intentionally omitted — not needed for PoUW proof.
 
     if (lane == 0) {
         int num_tiles_n = (n + 15) / 16;

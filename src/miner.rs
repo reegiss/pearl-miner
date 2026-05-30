@@ -142,7 +142,10 @@ fn mining_loop(
     let mut job        = 0u64;
     let start          = Instant::now();
     let mut last_log   = start;
-    let mut t_gpu      = 0u128;
+    let mut _t_gpu     = 0u128;
+    let mut t_kernel_acc = 0u128;
+    let mut t_dtoh_acc   = 0u128;
+    let mut t_blake3_acc = 0u128;
 
     while !cancel.load(Ordering::Relaxed) {
         job += 1;
@@ -160,19 +163,23 @@ fn mining_loop(
         }
 
         // GPU: tiled matmul A'·B', M-state accumulation, BLAKE3 difficulty check
-        match gpu.mine(params, &virtual_sa) {
-            Ok(blocks) if !blocks.is_empty() => {
+        let [t_kernel, t_dtoh, t_blake3] = match gpu.mine(params, &virtual_sa) {
+            Ok((blocks, timing)) => {
                 for blk in &blocks {
                     println!(
-                        "[PoUW] gpu:{gpu_idx} tile=({},{}) hash={} wallet={wallet}",
-                        blk.tile_i, blk.tile_j, hex_bytes(&blk.hash),
+                        "[PoUW] gpu:{gpu_idx} tile=({},{}) hash={}",
+                        blk.tile_i, blk.tile_j, &hex_bytes(&blk.hash)[..16],
                     );
                 }
+                timing
             }
-            Ok(_) => {}
             Err(e) => { eprintln!("[gpu:{gpu_idx}] mine error: {e}"); break; }
-        }
-        t_gpu += t0.elapsed().as_micros();
+        };
+        let _ = wallet;
+        _t_gpu        += t0.elapsed().as_micros();
+        t_kernel_acc  += t_kernel;
+        t_dtoh_acc    += t_dtoh;
+        t_blake3_acc  += t_blake3;
 
         let new_total = total_hashes.fetch_add(tiles_per_job, Ordering::Relaxed) + tiles_per_job;
 
@@ -181,10 +188,13 @@ fn mining_loop(
             if (now - last_log).as_secs_f64() >= 5.0 {
                 let elapsed = (now - start).as_secs_f64().max(0.001);
                 let kernel  = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
+                let j = job as f64;
                 println!(
-                    "[miner] {} [{kernel}] {:.1}ms/job",
+                    "[miner] {} [{kernel}] kernel={:.1}ms dtoh={:.1}ms blake3={:.1}ms",
                     fmt_hashrate(new_total as f64 / elapsed),
-                    t_gpu as f64 / job as f64 / 1000.0,
+                    t_kernel_acc as f64 / j / 1000.0,
+                    t_dtoh_acc   as f64 / j / 1000.0,
+                    t_blake3_acc as f64 / j / 1000.0,
                 );
                 last_log = now;
             }

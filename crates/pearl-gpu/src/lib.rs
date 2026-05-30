@@ -67,7 +67,7 @@ impl GpuMiner {
 
         let d_a = Mutex::new(stream.alloc_zeros::<i8>(m * k)?);
         let d_b = Mutex::new(stream.alloc_zeros::<i8>(k * n)?);
-        let d_c = Mutex::new(stream.alloc_zeros::<i32>(m * n)?);
+        let d_c = Mutex::new(stream.alloc_zeros::<i32>(1)?);  // placeholder — kernel never writes C
         let d_m = Mutex::new(stream.alloc_zeros::<u32>(num_tiles * 16)?);
 
         Ok(Self {
@@ -107,12 +107,12 @@ impl GpuMiner {
     }
 
     /// Run the matmul kernel on d_a (already filled) and check BLAKE3 difficulty.
-    /// Pair with `generate_noisy_a` for the GPU-only pipeline.
+    /// Returns (found_blocks, [t_kernel_us, t_dtoh_us, t_blake3_us]).
     pub fn mine(
         &self,
         params: &MiningParams,
         s_a:    &[u8; 32],
-    ) -> Result<Vec<FoundBlock>, GpuError> {
+    ) -> Result<(Vec<FoundBlock>, [u128; 3]), GpuError> {
         let (m, n, k, r)    = (self.m, self.n, self.k, self.r);
         let (ntm, ntn)      = (self.num_tiles_m, self.num_tiles_n);
         let (mi, ni, ki, ri) = (m as i32, n as i32, k as i32, r as i32);
@@ -123,12 +123,13 @@ impl GpuMiner {
         let mut d_c = self.d_c.lock().unwrap();
         let mut d_m = self.d_m.lock().unwrap();
 
+        let t_kernel_start = std::time::Instant::now();
         if self.use_wmma {
-            // 4 warps per block: Bs (r×16) + 4 × As (16×r) = 5×r×16 bytes
-            let smem = (5 * r * 16) as u32;
+            // 8 warps per block: Bs(r×16) + 8×As(16×r) = 9×r×16 bytes
+            let smem = (9 * r * 16) as u32;
             let cfg = LaunchConfig {
-                grid_dim:         (ntn as u32, ((ntm + 3) / 4) as u32, 1),
-                block_dim:        (32, 4, 1),
+                grid_dim:         (ntn as u32, ((ntm + 7) / 8) as u32, 1),
+                block_dim:        (32, 8, 1),
                 shared_mem_bytes: smem,
             };
             let mut b = self.stream.launch_builder(&self.func_wmma);
@@ -148,11 +149,17 @@ impl GpuMiner {
             b.arg(&mi); b.arg(&ni); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg) }?;
         }
+        self.stream.synchronize()?;
+        let t_kernel = t_kernel_start.elapsed().as_micros();
 
-        let m_states  = self.stream.clone_dtoh(&*d_m)?;
+        let t_dtoh_start = std::time::Instant::now();
+        let m_states = self.stream.clone_dtoh(&*d_m)?;
+        let t_dtoh = t_dtoh_start.elapsed().as_micros();
+
         let threshold = difficulty_threshold(params.difficulty, r, TM, TN);
         let num_tiles = ntm * ntn;
 
+        let t_blake3_start = std::time::Instant::now();
         let found: Vec<FoundBlock> = (0..num_tiles).into_par_iter().filter_map(|idx| {
             let ti = idx / ntn;
             let tj = idx % ntn;
@@ -166,8 +173,9 @@ impl GpuMiner {
                 None
             }
         }).collect();
+        let t_blake3 = t_blake3_start.elapsed().as_micros();
 
-        Ok(found)
+        Ok((found, [t_kernel, t_dtoh, t_blake3]))
     }
 }
 

@@ -152,7 +152,7 @@ impl GpuMiner {
         self.stream.memcpy_htod(&zero, &mut *self.d_found_count.lock().unwrap())?;
 
         // Lock all buffers
-        let mut d_a = self.d_a.lock().unwrap();
+        let mut d_el = self.d_el.lock().unwrap();
         let d_b  = self.d_b.lock().unwrap();
         let mut d_c = self.d_c.lock().unwrap();
         let mut d_m = self.d_m.lock().unwrap();
@@ -164,20 +164,19 @@ impl GpuMiner {
         // --- Matmul kernel ---
         let t_kernel_start = std::time::Instant::now();
 
-        // Stage 1: generate A' = A + EL·ER on GPU (dedicated low-register kernel)
+        // Stage 1: generate EL noise factor on GPU
         {
             let bx: u32 = 32;
             let by: u32 = 16;
-            let gx = (ki as u32 + bx - 1) / bx;
+            let gx = (ri as u32 + bx - 1) / bx;
             let gy = (mi as u32 + by - 1) / by;
             let cfg_gen = LaunchConfig {
                 grid_dim:         (gx, gy, 1),
                 block_dim:        (bx, by, 1),
                 shared_mem_bytes: 0,
             };
-            let mut b = self.stream.launch_builder(&self.func_gen_a);
-            b.arg(&mut *d_a); b.arg(&job_seed); b.arg(&sa_u64);
-            b.arg(&mi); b.arg(&ki); b.arg(&ri);
+            let mut b = self.stream.launch_builder(&self.func_noise_gen);
+            b.arg(&sa_u64); b.arg(&mut *d_el); b.arg(&mi); b.arg(&ri);
             unsafe { b.launch(cfg_gen) }?;
         }
 
@@ -192,7 +191,7 @@ impl GpuMiner {
                 shared_mem_bytes: smem,
             };
             let mut b = self.stream.launch_builder(&self.func_wmma);
-            b.arg(&*d_a); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
+            b.arg(&job_seed); b.arg(&sa_u64); b.arg(&*d_el); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
             b.arg(&mi); b.arg(&ni); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg) }?;
         } else {
@@ -204,7 +203,7 @@ impl GpuMiner {
                 shared_mem_bytes: shared,
             };
             let mut b = self.stream.launch_builder(&self.func_dp4a);
-            b.arg(&*d_a); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
+            b.arg(&job_seed); b.arg(&sa_u64); b.arg(&*d_el); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
             b.arg(&mi); b.arg(&ni); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg) }?;
         }

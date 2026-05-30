@@ -59,9 +59,11 @@ pub struct GpuMiner {
     func_wmma:      CudaFunction,
     func_blake3:    CudaFunction,
     func_gen_a:     CudaFunction,
+    func_gen_el:    CudaFunction,
     func_solve_pool: CudaFunction,
     use_wmma:       bool,
     d_a:           Mutex<CudaSlice<i8>>,   // A' (m×k) — regenerated each job
+    d_el:          Mutex<CudaSlice<i8>>,   // Noise factor matrix EL (m×r) — pre-computed once per job
     d_b:           Mutex<CudaSlice<i8>>,   // B' (k×n) — set once per challenge
     d_c:           Mutex<CudaSlice<i32>>,  // placeholder (kernel never writes C)
     d_m:           Mutex<CudaSlice<u32>>,  // M states (num_tiles×16)
@@ -91,6 +93,7 @@ impl GpuMiner {
         let func_wmma      = module.load_function("tiled_matmul_wmma")?;
         let func_blake3    = module.load_function("blake3_check")?;
         let func_gen_a     = module.load_function("generate_a_prime")?;
+        let func_gen_el    = module.load_function("generate_el_matrix")?;
         let func_solve_pool = module.load_function("solve_blake3_pool")?;
         let use_wmma       = sm >= 72;
 
@@ -100,6 +103,7 @@ impl GpuMiner {
         let num_tiles    = num_tiles_m * num_tiles_n;
 
         let d_a           = Mutex::new(stream.alloc_zeros::<i8>(m * k)?);
+        let d_el          = Mutex::new(stream.alloc_zeros::<i8>(m * r)?);
         let d_b           = Mutex::new(stream.alloc_zeros::<i8>(k * n)?);
         let d_c           = Mutex::new(stream.alloc_zeros::<i32>(1)?);
         let d_m           = Mutex::new(stream.alloc_zeros::<u32>(num_tiles * 16)?);
@@ -112,8 +116,8 @@ impl GpuMiner {
 
         Ok(Self {
             ctx, stream, module,
-            func_dp4a, func_wmma, func_blake3, func_gen_a, func_solve_pool, use_wmma,
-            d_a, d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
+            func_dp4a, func_wmma, func_blake3, func_gen_a, func_gen_el, func_solve_pool, use_wmma,
+            d_a, d_el, d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
             d_best_nonce, d_best_hash,
             m, n, k, r, num_tiles_m, num_tiles_n,
             info: GpuInfo { name, mem_mb, use_wmma, sm },
@@ -165,6 +169,7 @@ impl GpuMiner {
 
         // Lock all buffers
         let mut d_a = self.d_a.lock().unwrap();
+        let mut d_el = self.d_el.lock().unwrap();
         let d_b  = self.d_b.lock().unwrap();
         let mut d_c = self.d_c.lock().unwrap();
         let mut d_m = self.d_m.lock().unwrap();
@@ -178,20 +183,29 @@ impl GpuMiner {
         // --- Matmul kernel ---
         let t_kernel_start = std::time::Instant::now();
 
+        // Stage 0: Pre-compute EL matrix
+        {
+            let threads = 1024u32;
+            let blocks  = ((mi * ri) as u32 + threads - 1) / threads;
+            let cfg_el  = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            let mut b   = self.stream.launch_builder(&self.func_gen_el);
+            b.arg(&mut *d_el); b.arg(&sa_u64); b.arg(&mi); b.arg(&ri);
+            unsafe { b.launch(cfg_el) }?;
+        }
+
         // Stage 1: generate A' = A + EL·ER on GPU (dedicated low-register kernel)
         {
             let bx: u32 = 32;
             let by: u32 = 16;
             let gx = (ki as u32 + bx - 1) / bx;
             let gy = (mi as u32 + by - 1) / by;
-            let smem_gen = (by as usize * r) as u32; // Cache 16 rows of EL
             let cfg_gen = LaunchConfig {
                 grid_dim:         (gx, gy, 1),
                 block_dim:        (bx, by, 1),
-                shared_mem_bytes: smem_gen,
+                shared_mem_bytes: 0,
             };
             let mut b = self.stream.launch_builder(&self.func_gen_a);
-            b.arg(&mut *d_a); b.arg(&job_seed); b.arg(&sa_u64);
+            b.arg(&mut *d_a); b.arg(&*d_el); b.arg(&job_seed); b.arg(&sa_u64);
             b.arg(&mi); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg_gen) }?;
         }

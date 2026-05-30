@@ -152,34 +152,60 @@ __device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Kernel 0: generate A' = A + EL·ER into global memory              */
+/*  Kernel 0: generate EL noise factor matrix (m x r)                 */
+/* ------------------------------------------------------------------ */
+
+extern "C" __global__ void generate_el_matrix(
+    int8_t*  __restrict__ EL,
+    uint64_t sa_seed,
+    int m, int r
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * r;
+    if (tid >= total) return;
+
+    int row = tid / r;
+    int col = tid % r;
+    const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
+    const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
+    const uint64_t base_el = sa_seed ^ 0x200ULL;
+
+    uint64_t s = splitmix64(base_el ^ ((uint64_t)row * row_mul) ^ ((uint64_t)col * col_mul));
+    EL[tid] = (int8_t)((s & 0x3F) - 32);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Kernel 1: generate A' = A + EL·ER into global memory              */
 /* ------------------------------------------------------------------ */
 
 extern "C" __global__ void generate_a_prime(
     int8_t*  __restrict__ A_prime,
+    const int8_t* __restrict__ EL,
     uint64_t job_seed, uint64_t sa_seed,
     int m, int k, int r
 ) {
     int col = blockIdx.x * blockDim.x + threadIdx.x; // 0..k
     int row = blockIdx.y * blockDim.y + threadIdx.y; // 0..m
+    if (row >= m || col >= k) return;
 
-    // Each block processes 16 rows. We cache 16*r elements of EL.
-    extern __shared__ int8_t EL_sh[]; 
-
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int total_el = blockDim.y * r;
     const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
     const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
-    const uint64_t base_el = sa_seed ^ 0x200ULL;
 
-    for (int idx = tid; idx < total_el; idx += blockDim.x * blockDim.y) {
-        int r_idx = idx / r;
-        int c_idx = idx % r;
-        int grow = blockIdx.y * blockDim.y + r_idx;
-        if (grow < m) {
-            uint64_t s = splitmix64(base_el ^ ((uint64_t)grow * row_mul) ^ ((uint64_t)c_idx * col_mul));
-            EL_sh[r_idx * r + c_idx] = (int8_t)((s & 0x3F) - 32);
-        }
+    // Compute ER positions for this column
+    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ ((uint64_t)col * col_mul));
+    int pos_col = (int)(er_s & (r - 1));
+    er_s = splitmix64(er_s);
+    int neg_col = (int)(er_s & (r - 1));
+    if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
+
+    // Compute A
+    int8_t a_val = (int8_t)((splitmix64(job_seed ^ ((uint64_t)row * row_mul) ^ ((uint64_t)col * col_mul)) & 0x7F) - 64);
+    
+    int val = (int)a_val + (int)__ldg(&EL[row * r + pos_col]) - (int)__ldg(&EL[row * r + neg_col]);
+    if (val > 127) val = 127;
+    if (val < -127) val = -127;
+    A_prime[row * k + col] = (int8_t)val;
+}
     }
     __syncthreads();
 

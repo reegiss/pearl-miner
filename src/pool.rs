@@ -222,7 +222,7 @@ async fn connect(
                 msg_id += 1;
 
                 if submit.job_id.is_empty() {
-                    println!("[pool] no job_id yet, skipping mining.submit");
+                    println!("[pool] -> pearl.challenge_response nonce={} (no job_id, skipping mining.submit)", submit.nonce);
                     writer.write_all(format!("{cr}\n").as_bytes()).await?;
                 } else {
                     // mining.submit — credits the share on the pool dashboard
@@ -233,6 +233,7 @@ async fn connect(
                     });
                     pending.insert(msg_id, "submit");
                     msg_id += 1;
+                    println!("[pool] -> pearl.challenge_response + mining.submit nonce={} job={}", submit.nonce, submit.job_id);
                     writer.write_all(format!("{cr}\n{ms}\n").as_bytes()).await?;
                 }
             }

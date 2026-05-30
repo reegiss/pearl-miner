@@ -107,9 +107,11 @@ impl Miner {
                 let job_c    = job_id.clone();
                 handles.push(tokio::task::spawn_blocking(move || {
                     if let Some(nonce) = solve_blake3_challenge(sigma, difficulty, &cancel_c) {
+                        let nonce_hex = format!("{:016x}", nonce);
+                        println!("[miner] BLAKE3 solved: nonce={nonce_hex} diff={difficulty}");
                         let _ = submit_c.blocking_send(Submit {
                             seed:   seed_c,
-                            nonce:  format!("{:016x}", nonce),
+                            nonce:  nonce_hex,
                             job_id: job_c,
                         });
                     }
@@ -177,14 +179,10 @@ fn mining_loop(
         // PoUW found blocks — submission format not yet confirmed by pool
         for _fb in found_blocks {}
 
-        // GPU pool solver found a nonce that satisfies BLAKE3 difficulty
-        if check_difficulty(&best_hash, params.difficulty) {
-            let _ = submit_tx.blocking_send(Submit {
-                seed:   seed_hex.clone(),
-                nonce:  format!("{:016x}", best_nonce),
-                job_id: job_id.clone(),
-            });
-        }
+        // GPU solve_blake3_pool solves BLAKE3(virtual_sa||nonce), not BLAKE3(sigma||nonce).
+        // The pool checks BLAKE3(sigma||nonce), so GPU nonces are invalid for pool submission.
+        // Only the CPU solver (solve_blake3_challenge) submits valid pool shares.
+        let _ = (best_nonce, best_hash);
 
         let _ = wallet;
         t_kernel_acc += t_kernel;

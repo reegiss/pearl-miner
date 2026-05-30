@@ -153,18 +153,29 @@ __device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
 
 // Derive a unique seed for element (row, col) from base seed
 __device__ __forceinline__ uint64_t elem_seed(uint64_t base, uint64_t row, uint64_t col) {
-    return splitmix64(base ^ (row * 0x9e3779b97f4a7c15ULL) ^ (col * 0xd1b54a32d192ed03ULL));
+    const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
+    const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
+    return splitmix64(base ^ (row * row_mul) ^ (col * col_mul));
 }
 
 __device__ __forceinline__ int8_t compute_noisy_a(uint64_t job_seed, uint64_t sa_seed, int row, int col, int r) {
-    int8_t a_val = (int8_t)((elem_seed(job_seed, (uint64_t)row, (uint64_t)col) & 0x7F) - 64);
-    uint64_t er_s = elem_seed(sa_seed ^ 0x100ULL, 0ULL, (uint64_t)col);
-    int pos_col = (int)(er_s % (uint64_t)r);
+    const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
+    const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
+    const uint64_t global_col_part = (uint64_t)col * col_mul;
+    const uint64_t row_part = (uint64_t)row * row_mul;
+
+    int8_t a_val = (int8_t)((splitmix64(job_seed ^ row_part ^ global_col_part) & 0x7F) - 64);
+    
+    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ global_col_part);
+    int pos_col = (int)(er_s & (r - 1));
     er_s = splitmix64(er_s);
-    int neg_col = (int)(er_s % (uint64_t)r);
-    if (neg_col == pos_col) neg_col = (neg_col + 1) % r;
-    int8_t el_pos = (int8_t)((elem_seed(sa_seed ^ 0x200ULL, (uint64_t)row, (uint64_t)pos_col) & 0x3F) - 32);
-    int8_t el_neg = (int8_t)((elem_seed(sa_seed ^ 0x200ULL, (uint64_t)row, (uint64_t)neg_col) & 0x3F) - 32);
+    int neg_col = (int)(er_s & (r - 1));
+    if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
+
+    const uint64_t base_el = (sa_seed ^ 0x200ULL);
+    int8_t el_pos = (int8_t)((splitmix64(base_el ^ row_part ^ ((uint64_t)pos_col * col_mul)) & 0x3F) - 32);
+    int8_t el_neg = (int8_t)((splitmix64(base_el ^ row_part ^ ((uint64_t)neg_col * col_mul)) & 0x3F) - 32);
+    
     int val = (int)a_val + (int)el_pos - (int)el_neg;
     if (val > 127) val = 127;
     if (val < -127) val = -127;
@@ -209,12 +220,47 @@ extern "C" __global__ void tiled_matmul_dp4a(
         const int s = ell * r;
 
         {
+            // Optimized A-matrix loading: hoist ER noise calculation per column
+            const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
+            const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
+            const uint64_t base_el  = (sa_seed ^ 0x200ULL);
+
+            int last_col = -1;
+            uint64_t base_job, pos_part, neg_part;
+            int pos_col, neg_col;
+
             int total = TM * r;
             for (int idx = tid; idx < total; idx += TM * TN) {
                 int row = idx / r, col = idx % r;
+                if (col != last_col) {
+                    const int global_col = s + col;
+                    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ ((uint64_t)global_col * col_mul));
+                    pos_col = (int)(er_s & (r - 1));
+                    er_s = splitmix64(er_s);
+                    neg_col = (int)(er_s & (r - 1));
+                    if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
+
+                    base_job = job_seed ^ ((uint64_t)global_col * col_mul);
+                    pos_part = (uint64_t)pos_col * col_mul;
+                    neg_part = (uint64_t)neg_col * col_mul;
+                    last_col = col;
+                }
+
                 int grow = tile_i * TM + row;
-                As[row * r + col] = (grow < m && (s + col) < k)
-                    ? compute_noisy_a(job_seed, sa_seed, grow, s + col, r) : (int8_t)0;
+                const int global_col = s + col;
+                if (grow < m && global_col < k) {
+                    uint64_t row_part = (uint64_t)grow * row_mul;
+                    int8_t a_val = (int8_t)((splitmix64(base_job ^ row_part) & 0x7F) - 64);
+                    int8_t el_pos = (int8_t)((splitmix64(base_el ^ row_part ^ pos_part) & 0x3F) - 32);
+                    int8_t el_neg = (int8_t)((splitmix64(base_el ^ row_part ^ neg_part) & 0x3F) - 32);
+                    
+                    int val = (int)a_val + (int)el_pos - (int)el_neg;
+                    if (val > 127) val = 127;
+                    if (val < -127) val = -127;
+                    As[idx] = (int8_t)val;
+                } else {
+                    As[idx] = (int8_t)0;
+                }
             }
         }
         {
@@ -330,11 +376,43 @@ extern "C" __global__ void tiled_matmul_wmma(
         __syncthreads();
 
         if (active) {
-            for (int idx = lane; idx < 16 * r; idx += 32) {
-                int row = idx / r, col = idx % r;
-                int grow = a_row_base + row;
-                wAs[idx] = (grow < m && (s + col) < k)
-                    ? compute_noisy_a(job_seed, sa_seed, grow, s + col, r) : (int8_t)0;
+            // Optimized A-matrix loading: hoist ER noise calculation per column
+            const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
+            const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
+            const uint64_t base_el  = (sa_seed ^ 0x200ULL);
+
+            for (int c_off = 0; c_off < r; c_off += 32) {
+                int col = c_off + lane;
+                if (col < r) {
+                    const int global_col = s + col;
+                    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ ((uint64_t)global_col * col_mul));
+                    int pos_col = (int)(er_s & (r - 1));
+                    er_s = splitmix64(er_s);
+                    int neg_col = (int)(er_s & (r - 1));
+                    if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
+
+                    const uint64_t base_job = job_seed ^ ((uint64_t)global_col * col_mul);
+                    const uint64_t pos_part = (uint64_t)pos_col * col_mul;
+                    const uint64_t neg_part = (uint64_t)neg_col * col_mul;
+
+                    #pragma unroll
+                    for (int row = 0; row < 16; row++) {
+                        int grow = a_row_base + row;
+                        if (grow < m && global_col < k) {
+                            uint64_t row_part = (uint64_t)grow * row_mul;
+                            int8_t a_val = (int8_t)((splitmix64(base_job ^ row_part) & 0x7F) - 64);
+                            int8_t el_pos = (int8_t)((splitmix64(base_el ^ row_part ^ pos_part) & 0x3F) - 32);
+                            int8_t el_neg = (int8_t)((splitmix64(base_el ^ row_part ^ neg_part) & 0x3F) - 32);
+                            
+                            int val = (int)a_val + (int)el_pos - (int)el_neg;
+                            if (val > 127) val = 127;
+                            if (val < -127) val = -127;
+                            wAs[row * r + col] = (int8_t)val;
+                        } else {
+                            wAs[row * r + col] = (int8_t)0;
+                        }
+                    }
+                }
             }
             __syncwarp();
 

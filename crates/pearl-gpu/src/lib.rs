@@ -1,4 +1,8 @@
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::sys::CUdevice_attribute::{
+    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR as CC_MAJOR,
+    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR as CC_MINOR,
+};
 use cudarc::nvrtc::Ptx;
 use pearl_types::{FoundBlock, MiningParams};
 use std::sync::{Arc, Mutex};
@@ -14,15 +18,31 @@ pub enum GpuError {
 
 const TM: usize = 16;
 const TN: usize = 16;
-const FOUND_STRIDE: usize = 26; // u32s per found entry: 2 tile coords + 16 m_state + 8 hash
+const FOUND_STRIDE: usize = 26;
 const MAX_FOUND: usize = 256;
 
-static MATMUL_PTX: &str = include_str!(env!("MATMUL_PTX_PATH"));
+static PTX_SM75: &str = include_str!(env!("MATMUL_PTX_SM75"));
+
+#[cfg(has_sm86_ptx)]
+static PTX_SM86: &str = include_str!(env!("MATMUL_PTX_SM86"));
+
+#[cfg(has_sm89_ptx)]
+static PTX_SM89: &str = include_str!(env!("MATMUL_PTX_SM89"));
+
+fn best_ptx(sm: u32) -> &'static str {
+    #[cfg(has_sm89_ptx)]
+    if sm >= 89 { return PTX_SM89; }
+    #[cfg(has_sm86_ptx)]
+    if sm >= 86 { return PTX_SM86; }
+    let _ = sm;
+    PTX_SM75
+}
 
 pub struct GpuInfo {
     pub name:     String,
     pub mem_mb:   usize,
     pub use_wmma: bool,
+    pub sm:       u32,
 }
 
 pub fn device_count() -> usize {
@@ -58,14 +78,17 @@ impl GpuMiner {
         let ctx    = CudaContext::new(device_id).map_err(|_| GpuError::NoDevice(device_id))?;
         let name   = ctx.name().unwrap_or_else(|_| "Unknown GPU".into());
         let mem_mb = ctx.total_mem().unwrap_or(0) / (1024 * 1024);
+        let major  = ctx.attribute(CC_MAJOR).unwrap_or(7) as u32;
+        let minor  = ctx.attribute(CC_MINOR).unwrap_or(5) as u32;
+        let sm     = major * 10 + minor;
         let stream = ctx.default_stream();
-        let module = ctx.load_module(Ptx::from_src(MATMUL_PTX))?;
+        let module = ctx.load_module(Ptx::from_src(best_ptx(sm)))?;
 
         let func_dp4a   = module.load_function("tiled_matmul_dp4a")?;
         let func_wmma   = module.load_function("tiled_matmul_wmma")?;
         let func_gen_a  = module.load_function("generate_noisy_a")?;
         let func_blake3 = module.load_function("blake3_check")?;
-        let use_wmma    = has_tensor_cores(&name);
+        let use_wmma    = sm >= 72;
 
         let (m, n, k, r) = (params.m, params.n, params.k, params.r);
         let num_tiles_m  = (m + TM - 1) / TM;
@@ -86,7 +109,7 @@ impl GpuMiner {
             func_dp4a, func_wmma, func_gen_a, func_blake3, use_wmma,
             d_a, d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
             m, n, k, r, num_tiles_m, num_tiles_n,
-            info: GpuInfo { name, mem_mb, use_wmma },
+            info: GpuInfo { name, mem_mb, use_wmma, sm },
         })
     }
 
@@ -227,13 +250,6 @@ impl GpuMiner {
     }
 }
 
-fn has_tensor_cores(name: &str) -> bool {
-    let n = name.to_ascii_uppercase();
-    n.contains("RTX")
-        || n.contains("A100") || n.contains("H100") || n.contains("H200")
-        || n.contains("V100") || n.contains("T4")   || n.contains("A10")
-        || n.contains("A30")  || n.contains("A40")
-}
 
 fn difficulty_threshold(b: u32, r: usize, tm: usize, tn: usize) -> [u8; 32] {
     let mut val = [0u8; 32];
@@ -251,13 +267,3 @@ fn difficulty_threshold(b: u32, r: usize, tm: usize, tn: usize) -> [u8; 32] {
     val
 }
 
-fn hash_le_threshold(hash: &[u8; 32], threshold: &[u8; 32]) -> bool {
-    for i in (0..32).rev() {
-        match hash[i].cmp(&threshold[i]) {
-            std::cmp::Ordering::Less    => return true,
-            std::cmp::Ordering::Greater => return false,
-            std::cmp::Ordering::Equal   => continue,
-        }
-    }
-    true
-}

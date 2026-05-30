@@ -31,7 +31,7 @@ impl Miner {
         for &id in device_ids {
             let gpu = GpuMiner::new(id, &params)?;
             let kernel = if gpu.info.use_wmma { "WMMA tensor cores" } else { "DP4A CUDA cores" };
-            println!("[gpu:{}] {} · {} MB · {}", id, gpu.info.name, gpu.info.mem_mb, kernel);
+            println!("[gpu:{}] {} · {} MB · {} · sm_{}", id, gpu.info.name, gpu.info.mem_mb, kernel, gpu.info.sm);
             gpus.push(Arc::new(gpu));
         }
         Ok(Self { gpus })

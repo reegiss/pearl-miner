@@ -151,15 +151,6 @@ __device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
-
-            wAs[row * r + col] = elem;
-            row_part += row_mul;
-        }
-    }
-}
-
-
-
 /* ------------------------------------------------------------------ */
 /*  Kernel 0: generate A' = A + EL·ER into global memory              */
 /* ------------------------------------------------------------------ */

@@ -174,9 +174,13 @@ fn mining_loop(
                 let elapsed = (now - start).as_secs_f64().max(0.001);
                 let kernel  = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
                 let j = job as f64;
+                let raw_rate = new_total as f64 / elapsed;
+                // Target multiplier normalized to baseline (r=32). 128/32 = 4x.
+                let effective_rate = raw_rate * (params.r as f64 / 32.0);
                 println!(
-                    "[miner] {} [{kernel}] kernel={:.1}ms dtoh={:.2}ms",
-                    fmt_hashrate(new_total as f64 / elapsed),
+                    "[miner] {} (Effective) / {} (Raw Tiles) [{kernel}] kernel={:.1}ms dtoh={:.2}ms",
+                    fmt_hashrate(effective_rate),
+                    fmt_hashrate(raw_rate),
                     t_kernel_acc as f64 / j / 1000.0,
                     t_dtoh_acc   as f64 / j / 1000.0,
                 );

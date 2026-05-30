@@ -301,11 +301,44 @@ extern "C" __global__ void tiled_matmul_dp4a(
 }
 
 /* ------------------------------------------------------------------ */
-/*  Kernel B: WMMA INT8 tensor cores (sm_72+, all RTX/tensor cards)   */
+/*  cp.async helpers — sm_80+ (Ampere) only                           */
+/*  cp.async.ca writes directly to shared memory, bypassing L1.       */
+/* ------------------------------------------------------------------ */
+
+#if __CUDA_ARCH__ >= 800
+
+__device__ __forceinline__
+void cp_async16(void* dst, const void* src) {
+    uint32_t smem_ptr = __cvta_generic_to_shared(dst);
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        :: "r"(smem_ptr), "l"((const char*)src) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+// Wait until all pending cp.async groups are done.
+__device__ __forceinline__ void cp_async_wait0() {
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+}
+
+#endif  // __CUDA_ARCH__ >= 800
+
+/* ------------------------------------------------------------------ */
+/*  Kernel B: WMMA INT8 tensor cores (sm_72+)                         */
 /*                                                                     */
 /*  Uses m16n16k16 INT8 for all targets.                               */
-/*  On sm_86/89, nvcc maps this to native m16n8k16 pairs internally — */
-/*  correct and efficient without requiring col_major B storage.        */
+/*  sm_80+: B-strip is double-buffered via cp.async so B[ell+1] is    */
+/*  prefetched while tensor cores consume B[ell] (hides ~500-cycle    */
+/*  global-mem latency behind WMMA + A-strip load).                   */
+/*                                                                     */
+/*  Smem layout:                                                       */
+/*    sm_80+: Bs[0](r*16) | Bs[1](r*16) | wAs[8 warps](8*16*r)       */
+/*            = 10 * r * 16 bytes                                      */
+/*    sm_72+: Bs(r*16)    |              | wAs[8 warps](8*16*r)       */
+/*            =  9 * r * 16 bytes                                      */
 /* ------------------------------------------------------------------ */
 
 #if __CUDA_ARCH__ >= 720
@@ -332,8 +365,15 @@ extern "C" __global__ void tiled_matmul_wmma(
     const int  a_row_base = tile_i * 16;
     const int  b_col_base = tile_j * 16;
 
+    // Smem pointers — layout differs between sm_80+ and sm_72.
+#if __CUDA_ARCH__ >= 800
+    int8_t* Bs_buf0 = (int8_t*)smem_wmma;
+    int8_t* Bs_buf1 = Bs_buf0 + r * 16;
+    int8_t* wAs     = Bs_buf1 + r * 16 + warp_id * 16 * r;
+#else
     int8_t* Bs  = (int8_t*)smem_wmma;
     int8_t* wAs = Bs + r * 16 + warp_id * 16 * r;
+#endif
 
     fragment<accumulator, 16, 16, 16, int32_t> acc;
     fill_fragment(acc, 0);
@@ -342,17 +382,92 @@ extern "C" __global__ void tiled_matmul_wmma(
     #pragma unroll
     for (int q = 0; q < 16; q++) M[q] = 0;
 
-    const int num_steps  = k / r;
+    const int  num_steps  = k / r;
     const bool b_full_col = (b_col_base + 15 < n);
     const int  valid_rows = active ? min(16, m - a_row_base) : 0;
-    const int  r4         = r / 16;  // int4 chunks per A-strip row (r%16==0 always)
+    const int  r4         = r / 16;
+
+#if __CUDA_ARCH__ >= 800
+    /* ---- sm_80+ double-buffer path --------------------------------- */
+    int8_t* Bs_cur = Bs_buf0;
+    int8_t* Bs_nxt = Bs_buf1;
+
+    // Pre-load B[0] → Bs_cur before the main loop.
+    if (tid < r) {
+        if (b_full_col) {
+            cp_async16(Bs_cur + tid * 16, B + tid * n + b_col_base);
+        } else {
+            for (int c = 0; c < 16; c++)
+                Bs_cur[tid * 16 + c] = (b_col_base + c < n)
+                    ? __ldg(&B[tid * n + b_col_base + c]) : (int8_t)0;
+        }
+    }
+    cp_async_commit();
+    cp_async_wait0();
+    __syncthreads();
 
     for (int ell = 0; ell < num_steps; ell++) {
         const int s = ell * r;
 
-        // B-strip: 128-bit __ldg loads, only r threads participate.
-        // Alignment guaranteed: B is CUDA-allocated (256-byte aligned),
-        // each row is n bytes (multiple of 16), b_col_base = tile_j*16.
+        // Prefetch B[ell+1] → Bs_nxt while tensor cores consume B[ell].
+        // For the last iteration no prefetch is issued; commit creates an
+        // empty group that cp_async_wait0() clears immediately.
+        if (ell + 1 < num_steps && tid < r) {
+            const int s1 = s + r;
+            if (b_full_col) {
+                cp_async16(Bs_nxt + tid * 16,
+                           B + (s1 + tid) * n + b_col_base);
+            } else {
+                for (int c = 0; c < 16; c++)
+                    Bs_nxt[tid * 16 + c] = (b_col_base + c < n)
+                        ? __ldg(&B[(s1 + tid) * n + b_col_base + c]) : (int8_t)0;
+            }
+        }
+        cp_async_commit();  // all threads commit (empty for warps 1-7)
+
+        if (active) {
+            // A-strip: int4 loads [concurrent with B prefetch above]
+            for (int q = lane; q < 16 * r4; q += 32) {
+                const int row = q / r4, chunk = q % r4;
+                int4* dst = (int4*)wAs + q;
+                *dst = (row < valid_rows)
+                    ? __ldg((const int4*)(A + (a_row_base + row) * k + s) + chunk)
+                    : make_int4(0, 0, 0, 0);
+            }
+            __syncwarp();
+
+            const int sub_steps = r / 16;
+            for (int sub = 0; sub < sub_steps; sub++) {
+                fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+                fragment<matrix_b, 16, 16, 16, int8_t, row_major> b_frag;
+                load_matrix_sync(a_frag, wAs     + sub * 16,       r);
+                load_matrix_sync(b_frag, Bs_cur  + sub * 16 * 16, 16);
+                mma_sync(acc, a_frag, b_frag, acc);
+            }
+
+            uint32_t local_xor = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) local_xor ^= (uint32_t)acc.x[i];
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor, 16);
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  8);
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  4);
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  2);
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  1);
+            if (lane == 0)
+                M[ell & 15] = rol32(M[ell & 15], 13) ^ local_xor;
+        }
+
+        // Drain the prefetch, sync, then swap ping-pong buffers.
+        cp_async_wait0();
+        __syncthreads();
+        int8_t* tmp = Bs_cur; Bs_cur = Bs_nxt; Bs_nxt = tmp;
+    }
+
+#else
+    /* ---- sm_72–79 single-buffer path ------------------------------- */
+    for (int ell = 0; ell < num_steps; ell++) {
+        const int s = ell * r;
+
         if (tid < r) {
             if (b_full_col) {
                 *((int4*)(Bs + tid * 16)) =
@@ -366,17 +481,12 @@ extern "C" __global__ void tiled_matmul_wmma(
         __syncthreads();
 
         if (active) {
-            // Load 16×r A-strip via int4 (16-byte) loads — 1 pass for r=32, 2 for r=64.
-            // Alignment guaranteed: CUDA alloc (256B aligned), s=ell*r (r%16==0), row*k (k%r==0).
             for (int q = lane; q < 16 * r4; q += 32) {
-                const int row   = q / r4;
-                const int chunk = q % r4;
+                const int row = q / r4, chunk = q % r4;
                 int4* dst = (int4*)wAs + q;
-                if (row < valid_rows) {
-                    *dst = __ldg((const int4*)(A + (a_row_base + row) * k + s) + chunk);
-                } else {
-                    *dst = make_int4(0, 0, 0, 0);
-                }
+                *dst = (row < valid_rows)
+                    ? __ldg((const int4*)(A + (a_row_base + row) * k + s) + chunk)
+                    : make_int4(0, 0, 0, 0);
             }
             __syncwarp();
 
@@ -384,7 +494,7 @@ extern "C" __global__ void tiled_matmul_wmma(
             for (int sub = 0; sub < sub_steps; sub++) {
                 fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
                 fragment<matrix_b, 16, 16, 16, int8_t, row_major> b_frag;
-                load_matrix_sync(a_frag, wAs + sub * 16,       r);
+                load_matrix_sync(a_frag, wAs + sub * 16,      r);
                 load_matrix_sync(b_frag, Bs  + sub * 16 * 16, 16);
                 mma_sync(acc, a_frag, b_frag, acc);
             }
@@ -403,6 +513,7 @@ extern "C" __global__ void tiled_matmul_wmma(
 
         __syncthreads();
     }
+#endif  // __CUDA_ARCH__ >= 800
 
     if (!active) return;
 
@@ -420,4 +531,4 @@ extern "C" __global__ void tiled_matmul_wmma(
     const int8_t*, const int8_t*, int32_t*, uint32_t*,
     int, int, int, int) {}
 
-#endif
+#endif  // __CUDA_ARCH__ >= 720

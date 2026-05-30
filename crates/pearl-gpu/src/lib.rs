@@ -183,7 +183,9 @@ impl GpuMiner {
 
         // Stage 2: tiled matmul A'·B' + M-state accumulation
         if self.use_wmma {
-            let smem = (9 * r * 16) as u32;
+            // sm_80+: double-buffer Bs (10×r×16); sm_72-79: single-buffer (9×r×16).
+            // Always allocate the larger size — safe to over-allocate shared memory.
+            let smem = (10 * r * 16) as u32;
             let cfg = LaunchConfig {
                 grid_dim:         (ntn as u32, ((ntm + 7) / 8) as u32, 1),
                 block_dim:        (32, 8, 1),

@@ -1,150 +1,137 @@
 /*
- * Pearl PoUW — Tiled INT8 MatMul with M-state accumulation
+ * Pearl PoUW — Tiled INT8 MatMul with warp-level M-state accumulation
  *
- * Each thread block computes one output tile (i, j) of size TM×TN.
- * After every full depth step ℓ the XOR of all INT32 accumulators
- * is mixed into the 512-bit state M[16].
+ * One thread block per output tile (i,j), TM×TN threads.
+ * Depth loop: for each of k/r depth steps, accumulate INT32, then
+ * update M[16] using a two-phase XOR reduction:
+ *   1. __reduce_xor_sync within each warp  (hardware, 5 cycles)
+ *   2. thread 0 combines all warp results  (WARPS_PER_BLOCK iterations)
  *
- * Outputs:
- *   c_out  — full C' matrix in INT32, row-major
- *   m_out  — M[16] per tile, shape (num_tiles_m, num_tiles_n, 16)
+ * Dynamic shared memory layout:
+ *   [0            .. TM*r)       int8  As[TM][r]
+ *   [TM*r         .. (TM+TN)*r)  int8  Bs[r][TN]
+ *   [(TM+TN)*r    .. +4*WARPS)   u32   warp_xors[WARPS_PER_BLOCK]
+ *   [above+4*WARPS.. +64)        u32   M[16]
  */
 
 #include <stdint.h>
 
 #define TM 16
 #define TN 16
+#define WARPS_PER_BLOCK ((TM * TN) / 32)
 
 __device__ __forceinline__ uint32_t rol32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
 
 extern "C" __global__ void tiled_matmul(
-    const int8_t* __restrict__ A,   // m × k, row-major
-    const int8_t* __restrict__ B,   // k × n, row-major
-    int32_t*      __restrict__ C,   // m × n, row-major  (output)
-    uint32_t*     __restrict__ M_out, // (m/TM, n/TN, 16) (output)
+    const int8_t* __restrict__ A,
+    const int8_t* __restrict__ B,
+    int32_t*      __restrict__ C,
+    uint32_t*     __restrict__ M_out,
     int m, int n, int k, int r
 ) {
-    // Tile coordinates
-    const int tile_i = blockIdx.y;  // row tile index
-    const int tile_j = blockIdx.x;  // col tile index
-    const int ty     = threadIdx.y; // row within tile [0, TM)
-    const int tx     = threadIdx.x; // col within tile [0, TN)
+    extern __shared__ uint8_t smem[];
 
-    // Global matrix offsets for this tile
+    int8_t*  As        = (int8_t*)smem;
+    int8_t*  Bs        = (int8_t*)smem + TM * r;
+    uint32_t* warp_xors = (uint32_t*)(smem + (TM + TN) * r);
+    uint32_t* M         = warp_xors + WARPS_PER_BLOCK;
+
+    const int tile_i = blockIdx.y;
+    const int tile_j = blockIdx.x;
+    const int ty     = threadIdx.y;
+    const int tx     = threadIdx.x;
+    const int tid    = ty * TN + tx;
+    const int lane   = tid & 31;
+    const int warp   = tid >> 5;
+
     const int gi = tile_i * TM + ty;
     const int gj = tile_j * TN + tx;
 
-    // Accumulator for this output element
     int32_t acc = 0;
 
-    // Shared memory for A strip (TM × r) and B strip (r × TN)
-    __shared__ int8_t As[TM][32]; // max r=32 per depth step slice
-    __shared__ int8_t Bs[32][TN];
-
-    // M state — 16 × int32, maintained by thread 0
-    __shared__ uint32_t M[16];
-    if (ty == 0 && tx == 0) {
-        #pragma unroll
-        for (int q = 0; q < 16; q++) M[q] = 0;
-    }
-
-    // Shared scratch for XOR reduction (TM × TN elements)
-    __shared__ int32_t xor_scratch[TM * TN];
-
+    // Init M state
+    if (tid < 16) M[tid] = 0;
     __syncthreads();
 
-    int num_steps = k / r; // full depth steps only (partial ignored for M)
+    const int num_steps = k / r;
 
     for (int ell = 0; ell < num_steps; ell++) {
-        int s = ell * r; // start column in k dimension
+        const int s = ell * r;
 
-        // --- Load A strip: A[gi, s:s+r] ---
-        // Each thread loads one element of the strip it needs.
-        // We need TM rows × r cols. Each thread (ty, tx) loads A[gi, s + tx*(r/TN) + ...]
-        // Simple approach: stride over r using all TM×TN threads
+        // Load A strip: A[gi, s:s+r] into As[ty, 0:r]
         {
             int total = TM * r;
-            int tid   = ty * TN + tx;
             for (int idx = tid; idx < total; idx += TM * TN) {
-                int row = idx / r;
-                int col = idx % r;
-                int gi_row = tile_i * TM + row;
-                As[row][col] = (gi_row < m && (s + col) < k) ? A[gi_row * k + s + col] : 0;
+                int row = idx / r, col = idx % r;
+                int grow = tile_i * TM + row;
+                As[row * r + col] = (grow < m && (s + col) < k)
+                    ? A[grow * k + s + col] : 0;
             }
         }
 
-        // --- Load B strip: B[s:s+r, gj] ---
+        // Load B strip: B[s:s+r, gj] into Bs[0:r, tx]
         {
             int total = r * TN;
-            int tid   = ty * TN + tx;
             for (int idx = tid; idx < total; idx += TM * TN) {
-                int row = idx / TN;
-                int col = idx % TN;
-                int gj_col = tile_j * TN + col;
-                Bs[row][col] = ((s + row) < k && gj_col < n) ? B[(s + row) * n + gj_col] : 0;
+                int row = idx / TN, col = idx % TN;
+                int gcol = tile_j * TN + col;
+                Bs[row * TN + col] = ((s + row) < k && gcol < n)
+                    ? B[(s + row) * n + gcol] : 0;
             }
         }
 
         __syncthreads();
 
-        // --- Accumulate using DP4A (4 INT8s per instruction) ---
-        // Process r elements in groups of 4
-        int r4 = r / 4;
+        // Accumulate via DP4A — process r elements in groups of 4
+        const int r4 = r / 4;
         for (int q = 0; q < r4; q++) {
-            // Pack 4 consecutive A values into int32
-            int a_packed = 0;
-            a_packed |= ((int)(As[ty][q*4+0]) & 0xFF) <<  0;
-            a_packed |= ((int)(As[ty][q*4+1]) & 0xFF) <<  8;
-            a_packed |= ((int)(As[ty][q*4+2]) & 0xFF) << 16;
-            a_packed |= ((int)(As[ty][q*4+3]) & 0xFF) << 24;
-
-            int b_packed = 0;
-            b_packed |= ((int)(Bs[q*4+0][tx]) & 0xFF) <<  0;
-            b_packed |= ((int)(Bs[q*4+1][tx]) & 0xFF) <<  8;
-            b_packed |= ((int)(Bs[q*4+2][tx]) & 0xFF) << 16;
-            b_packed |= ((int)(Bs[q*4+3][tx]) & 0xFF) << 24;
-
-            acc = __dp4a(a_packed, b_packed, acc);
+            int a_pack = 0, b_pack = 0;
+            a_pack |= ((int)As[ty * r + q*4+0] & 0xFF) <<  0;
+            a_pack |= ((int)As[ty * r + q*4+1] & 0xFF) <<  8;
+            a_pack |= ((int)As[ty * r + q*4+2] & 0xFF) << 16;
+            a_pack |= ((int)As[ty * r + q*4+3] & 0xFF) << 24;
+            b_pack |= ((int)Bs[(q*4+0) * TN + tx] & 0xFF) <<  0;
+            b_pack |= ((int)Bs[(q*4+1) * TN + tx] & 0xFF) <<  8;
+            b_pack |= ((int)Bs[(q*4+2) * TN + tx] & 0xFF) << 16;
+            b_pack |= ((int)Bs[(q*4+3) * TN + tx] & 0xFF) << 24;
+            acc = __dp4a(a_pack, b_pack, acc);
         }
-
-        // Handle remainder if r % 4 != 0
+        // Tail if r not multiple of 4 (shouldn't happen with valid r)
         for (int q = r4 * 4; q < r; q++) {
-            acc += (int32_t)As[ty][q] * (int32_t)Bs[q][tx];
+            acc += (int32_t)As[ty * r + q] * (int32_t)Bs[q * TN + tx];
         }
 
-        // --- XOR reduction across tile ---
-        // Write this thread's accumulator to scratch
-        xor_scratch[ty * TN + tx] = acc;
+        // --- Warp XOR reduction via butterfly shuffle (sm_75+, ~5 cycles) ---
+        uint32_t wx = (uint32_t)acc;
+        wx ^= __shfl_xor_sync(0xffffffff, wx, 16);
+        wx ^= __shfl_xor_sync(0xffffffff, wx,  8);
+        wx ^= __shfl_xor_sync(0xffffffff, wx,  4);
+        wx ^= __shfl_xor_sync(0xffffffff, wx,  2);
+        wx ^= __shfl_xor_sync(0xffffffff, wx,  1);
+        if (lane == 0) warp_xors[warp] = wx;
         __syncthreads();
 
-        // Parallel XOR reduction — thread 0 computes final XOR
-        if (ty == 0 && tx == 0) {
+        // Thread 0 combines WARPS_PER_BLOCK warp results and updates M
+        if (tid == 0) {
             uint32_t X = 0;
-            for (int idx = 0; idx < TM * TN; idx++) {
-                X ^= (uint32_t)xor_scratch[idx];
-            }
-            // M[ℓ mod 16] = rotate_left(M[ℓ mod 16], 13) ^ X
+            #pragma unroll
+            for (int w = 0; w < WARPS_PER_BLOCK; w++) X ^= warp_xors[w];
             int slot = ell & 15;
             M[slot] = rol32(M[slot], 13) ^ X;
         }
-
         __syncthreads();
     }
 
-    // --- Write C' output ---
-    if (gi < m && gj < n) {
-        C[gi * n + gj] = acc;
-    }
+    // Write C output
+    if (gi < m && gj < n) C[gi * n + gj] = acc;
 
-    // --- Write M state output ---
-    if (ty == 0 && tx == 0) {
+    // Write M state
+    if (tid == 0) {
         int num_tiles_n = (n + TN - 1) / TN;
-        int m_base = (tile_i * num_tiles_n + tile_j) * 16;
+        int base = (tile_i * num_tiles_n + tile_j) * 16;
         #pragma unroll
-        for (int q = 0; q < 16; q++) {
-            M_out[m_base + q] = M[q];
-        }
+        for (int q = 0; q < 16; q++) M_out[base + q] = M[q];
     }
 }

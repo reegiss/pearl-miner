@@ -72,11 +72,15 @@ impl GpuMiner {
         let mut d_c = self.stream.alloc_zeros::<i32>(m * n)?;
         let mut d_m = self.stream.alloc_zeros::<u32>(num_tiles * 16)?;
 
-        // Launch kernel
+        // Dynamic shared memory:
+        //   As[TM×r] + Bs[r×TN] + warp_xors[WARPS×4] + M[16×4]
+        let warps = (TM * TN) / 32;
+        let shared_bytes = ((TM + TN) * r + warps * 4 + 16 * 4) as u32;
+
         let cfg = LaunchConfig {
             grid_dim:         (num_tiles_n as u32, num_tiles_m as u32, 1),
             block_dim:        (TN as u32, TM as u32, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: shared_bytes,
         };
 
         let (mi, ni, ki, ri) = (m as i32, n as i32, k as i32, r as i32);

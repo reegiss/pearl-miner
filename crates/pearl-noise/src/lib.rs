@@ -1,43 +1,55 @@
-/// Generate EL (m×r) and ER (r×k) from seed sA.
-///
-/// EL: uniform INT8 in [-32, 31] — 6-bit signed values
-/// ER: each column has exactly one +1 and one -1 at distinct random rows
-pub fn generate_e(m: usize, k: usize, r: usize, seed: &[u8; 32]) -> (Vec<i8>, Vec<i8>) {
-    let el = generate_el(m, r, seed, 0);
-    let er = generate_er(r, k, seed, 1);
-    (el, er)
+/// Noise for A: EL (dense m×r) + ER encoded as sparse column pairs.
+/// Each column j of ER has one +1 at row `pos[j]` and one -1 at row `neg[j]`.
+pub struct ENoise {
+    pub el:   Vec<i8>,           // m × r, row-major
+    pub er_cols: Vec<(u16, u16)>,// k entries: (pos_row, neg_row) per column of ER
 }
 
-/// Generate FL (n×r) and FR (r×k) from seed sB.
-///
-/// FL has ER^T distribution: each row has one +1 and one -1 at distinct random cols.
-/// FR has EL^T distribution: uniform INT8 in [-32, 31].
-pub fn generate_f(n: usize, k: usize, r: usize, seed: &[u8; 32]) -> (Vec<i8>, Vec<i8>) {
-    // FL (n×r): distribution of ER^T — each row has one +1 and one -1
-    let fl = generate_fl(n, r, seed, 0);
-    // FR (r×k): distribution of EL^T — uniform in [-32, 31] per spec
-    let fr = generate_el(r, k, seed, 1); // same distribution as EL
-    (fl, fr)
+/// Noise for B: FL encoded as sparse row pairs + FR (dense r×k).
+/// Each row i of FL has one +1 at col `pos[i]` and one -1 at col `neg[i]`.
+pub struct FNoise {
+    pub fl_rows: Vec<(u16, u16)>,// n entries: (pos_col, neg_col) per row of FL
+    pub fr:   Vec<i8>,           // r × k, row-major
 }
 
-/// Apply noise: out = matrix + EL·ER  (in-place, result in out).
-///
-/// matrix: m×k row-major i8
-/// el:     m×r row-major i8
-/// er:     r×k row-major i8  (sparse: one +1, one -1 per column)
-/// Returns A' = A + EL·ER as m×k i8, clamped to [-127, 127].
-pub fn apply_noise(matrix: &[i8], el: &[i8], er: &[i8], rows: usize, k: usize, r: usize) -> Vec<i8> {
-    let mut out = matrix.to_vec();
-    // For each output element (i, j): out[i*k+j] += sum_s(EL[i,s] * ER[s,j])
-    for i in 0..rows {
-        for s in 0..r {
-            let el_val = el[i * r + s] as i32;
-            if el_val == 0 { continue; }
-            for j in 0..k {
-                let er_val = er[s * k + j] as i32;
-                let idx = i * k + j;
-                out[idx] = (out[idx] as i32 + el_val * er_val).clamp(-127, 127) as i8;
-            }
+/// Generate E noise from sA.
+pub fn generate_e(m: usize, k: usize, r: usize, seed: &[u8; 32]) -> ENoise {
+    let el = gen_dense(m, r, seed, 0);
+    let er_cols = gen_sparse_cols(k, r, seed, 1);
+    ENoise { el, er_cols }
+}
+
+/// Generate F noise from sB.
+pub fn generate_f(n: usize, k: usize, r: usize, seed: &[u8; 32]) -> FNoise {
+    let fl_rows = gen_sparse_rows(n, r, seed, 0);
+    let fr      = gen_dense(r, k, seed, 1);
+    FNoise { fl_rows, fr }
+}
+
+/// A' = A + EL·ER  in O(m × k × 2) — exploits ER sparsity.
+pub fn apply_e(a: &[i8], noise: &ENoise, m: usize, k: usize, r: usize) -> Vec<i8> {
+    let mut out = a.to_vec();
+    for i in 0..m {
+        let el_row = &noise.el[i * r..(i + 1) * r];
+        for (j, &(pos, neg)) in noise.er_cols.iter().enumerate() {
+            let e = el_row[pos as usize] as i16 - el_row[neg as usize] as i16;
+            let v = out[i * k + j] as i16 + e;
+            out[i * k + j] = v.clamp(-127, 127) as i8;
+        }
+    }
+    out
+}
+
+/// B' = B + FL·FR  in O(n × k × 2) — exploits FL sparsity.
+pub fn apply_f(b: &[i8], noise: &FNoise, n: usize, k: usize) -> Vec<i8> {
+    let mut out = b.to_vec();
+    for (i, &(pos, neg)) in noise.fl_rows.iter().enumerate() {
+        let fr_pos = &noise.fr[pos as usize * k..(pos as usize + 1) * k];
+        let fr_neg = &noise.fr[neg as usize * k..(neg as usize + 1) * k];
+        for j in 0..k {
+            let f = fr_pos[j] as i16 - fr_neg[j] as i16;
+            let v = out[i * k + j] as i16 + f;
+            out[i * k + j] = v.clamp(-127, 127) as i8;
         }
     }
     out
@@ -45,62 +57,41 @@ pub fn apply_noise(matrix: &[i8], el: &[i8], er: &[i8], rows: usize, k: usize, r
 
 // --- internal generators ---
 
-fn generate_el(rows: usize, cols: usize, seed: &[u8; 32], domain: u8) -> Vec<i8> {
-    let mut out = vec![0i8; rows * cols];
+fn gen_dense(rows: usize, cols: usize, seed: &[u8; 32], domain: u8) -> Vec<i8> {
+    let mut out = Vec::with_capacity(rows * cols);
     for i in 0..rows {
         for j in 0..cols {
-            let val = prng_i6(seed, domain, i as u64, j as u64);
-            out[i * cols + j] = val;
+            out.push(prng_i6(seed, domain, i as u64, j as u64));
         }
     }
     out
 }
 
-fn generate_er(r: usize, k: usize, seed: &[u8; 32], domain: u8) -> Vec<i8> {
-    let mut out = vec![0i8; r * k];
-    for j in 0..k {
-        // Pick two distinct rows for +1 and -1
-        let row_pos = prng_range(seed, domain, j as u64, 0, r);
-        let mut row_neg = prng_range(seed, domain, j as u64, 1, r);
-        if row_neg == row_pos {
-            row_neg = (row_neg + 1) % r;
-        }
-        out[row_pos * k + j] = 1;
-        out[row_neg * k + j] = -1;
-    }
-    out
+fn gen_sparse_cols(k: usize, r: usize, seed: &[u8; 32], domain: u8) -> Vec<(u16, u16)> {
+    (0..k).map(|j| {
+        let pos = prng_range(seed, domain, j as u64, 0, r) as u16;
+        let mut neg = prng_range(seed, domain, j as u64, 1, r) as u16;
+        if neg == pos { neg = (neg + 1) % r as u16; }
+        (pos, neg)
+    }).collect()
 }
 
-fn generate_fl(n: usize, r: usize, seed: &[u8; 32], domain: u8) -> Vec<i8> {
-    // FL (n×r): each row has one +1 and one -1 — this is the ER^T distribution
-    let mut out = vec![0i8; n * r];
-    for i in 0..n {
-        let col_pos = prng_range(seed, domain, i as u64, 0, r);
-        let mut col_neg = prng_range(seed, domain, i as u64, 1, r);
-        if col_neg == col_pos {
-            col_neg = (col_neg + 1) % r;
-        }
-        out[i * r + col_pos] = 1;
-        out[i * r + col_neg] = -1;
-    }
-    out
+fn gen_sparse_rows(n: usize, r: usize, seed: &[u8; 32], domain: u8) -> Vec<(u16, u16)> {
+    (0..n).map(|i| {
+        let pos = prng_range(seed, domain, i as u64, 0, r) as u16;
+        let mut neg = prng_range(seed, domain, i as u64, 1, r) as u16;
+        if neg == pos { neg = (neg + 1) % r as u16; }
+        (pos, neg)
+    }).collect()
 }
 
-/// BLAKE3-based PRNG: returns uniform i8 in [-32, 31] (6-bit signed).
 fn prng_i6(seed: &[u8; 32], domain: u8, row: u64, col: u64) -> i8 {
-    let raw = prng_byte(seed, domain, row, col);
-    // Map 0..63 → -32..31
+    let raw = prng_u64(seed, domain, row, col) as u8;
     ((raw & 0x3F) as i8) - 32
 }
 
-/// BLAKE3-based PRNG: returns uniform value in 0..range.
 fn prng_range(seed: &[u8; 32], domain: u8, idx: u64, sub: u8, range: usize) -> usize {
-    let raw = prng_u64(seed, domain, idx, sub as u64);
-    (raw as usize) % range
-}
-
-fn prng_byte(seed: &[u8; 32], domain: u8, a: u64, b: u64) -> u8 {
-    prng_u64(seed, domain, a, b) as u8
+    (prng_u64(seed, domain, idx, sub as u64) as usize) % range
 }
 
 fn prng_u64(seed: &[u8; 32], domain: u8, a: u64, b: u64) -> u64 {

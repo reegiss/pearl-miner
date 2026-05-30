@@ -79,8 +79,10 @@ async fn connect(
                 let Some(line) = line? else { break; };
                 if line.trim().is_empty() { continue; }
 
+                // LOG RAW JSON FOR DIAGNOSIS
+                println!("[pool] <- {}", line);
+
                 let Ok(msg) = serde_json::from_str::<PoolMessage>(&line) else {
-                    println!("[pool] <- raw: {}", line);
                     continue;
                 };
 

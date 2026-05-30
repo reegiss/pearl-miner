@@ -1,7 +1,7 @@
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use pearl_types::{FoundBlock, MiningParams};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -36,11 +36,19 @@ pub struct GpuMiner {
     func_dp4a: CudaFunction,
     func_wmma: CudaFunction,
     use_wmma:  bool,
-    pub info:  GpuInfo,
+    // Pre-allocated device buffers — separate Mutexes to satisfy borrow checker
+    // with cudarc's builder pattern (immutable + mutable borrows coexist)
+    d_a: Mutex<CudaSlice<i8>>,   // A' (m×k) — uploaded per job
+    d_b: Mutex<CudaSlice<i8>>,   // B' (k×n) — uploaded once per challenge
+    d_c: Mutex<CudaSlice<i32>>,  // C  (m×n) — written by kernel
+    d_m: Mutex<CudaSlice<u32>>,  // M states (tiles×16) — written by kernel
+    m: usize, n: usize, k: usize, r: usize,
+    num_tiles_m: usize, num_tiles_n: usize,
+    pub info: GpuInfo,
 }
 
 impl GpuMiner {
-    pub fn new(device_id: usize) -> Result<Self, GpuError> {
+    pub fn new(device_id: usize, params: &MiningParams) -> Result<Self, GpuError> {
         let ctx    = CudaContext::new(device_id).map_err(|_| GpuError::NoDevice(device_id))?;
         let name   = ctx.name().unwrap_or_else(|_| "Unknown GPU".into());
         let mem_mb = ctx.total_mem().unwrap_or(0) / (1024 * 1024);
@@ -49,76 +57,85 @@ impl GpuMiner {
 
         let func_dp4a = module.load_function("tiled_matmul_dp4a")?;
         let func_wmma = module.load_function("tiled_matmul_wmma")?;
+        let use_wmma  = has_tensor_cores(&name);
 
-        // RTX cards (Turing/Ampere/Ada/Blackwell) have INT8 tensor cores.
-        // GTX 16xx is also sm75 but without tensor cores — detect by name.
-        let use_wmma = has_tensor_cores(&name);
+        let (m, n, k, r) = (params.m, params.n, params.k, params.r);
+        let num_tiles_m  = (m + TM - 1) / TM;
+        let num_tiles_n  = (n + TN - 1) / TN;
+        let num_tiles    = num_tiles_m * num_tiles_n;
+
+        let d_a = Mutex::new(stream.alloc_zeros::<i8>(m * k)?);
+        let d_b = Mutex::new(stream.alloc_zeros::<i8>(k * n)?);
+        let d_c = Mutex::new(stream.alloc_zeros::<i32>(m * n)?);
+        let d_m = Mutex::new(stream.alloc_zeros::<u32>(num_tiles * 16)?);
 
         Ok(Self {
             ctx, stream, module,
             func_dp4a, func_wmma, use_wmma,
+            d_a, d_b, d_c, d_m,
+            m, n, k, r, num_tiles_m, num_tiles_n,
             info: GpuInfo { name, mem_mb, use_wmma },
         })
     }
 
+    /// Upload B' to GPU — call once per challenge (B' is constant per challenge).
+    pub fn set_b(&self, b_prime: &[i8]) -> Result<(), GpuError> {
+        self.stream.memcpy_htod(b_prime, &mut *self.d_b.lock().unwrap())?;
+        Ok(())
+    }
+
+    /// Mine one job: upload A', run kernel, check BLAKE3 difficulty on CPU.
     pub fn mine(
         &self,
         a_prime: &[i8],
-        b_prime: &[i8],
         params:  &MiningParams,
         s_a:     &[u8; 32],
     ) -> Result<Vec<FoundBlock>, GpuError> {
-        let m = params.m;
-        let n = params.n;
-        let k = params.k;
-        let r = params.r;
-
-        let num_tiles_m = (m + TM - 1) / TM;
-        let num_tiles_n = (n + TN - 1) / TN;
-        let num_tiles   = num_tiles_m * num_tiles_n;
-
-        let d_a = self.stream.clone_htod(a_prime)?;
-        let d_b = self.stream.clone_htod(b_prime)?;
-        let mut d_c = self.stream.alloc_zeros::<i32>(m * n)?;
-        let mut d_m = self.stream.alloc_zeros::<u32>(num_tiles * 16)?;
-
+        let (m, n, k, r)    = (self.m, self.n, self.k, self.r);
+        let (ntm, ntn)      = (self.num_tiles_m, self.num_tiles_n);
         let (mi, ni, ki, ri) = (m as i32, n as i32, k as i32, r as i32);
 
+        // Upload A' — mutable borrow, release lock before kernel launch
+        { self.stream.memcpy_htod(a_prime, &mut *self.d_a.lock().unwrap())?; }
+
+        // Acquire all four buffers for kernel launch (no contention — 1 thread/GPU)
+        let d_a  = self.d_a.lock().unwrap();
+        let d_b  = self.d_b.lock().unwrap();
+        let mut d_c = self.d_c.lock().unwrap();
+        let mut d_m = self.d_m.lock().unwrap();
+
         if self.use_wmma {
-            // WMMA: 1 warp (32 threads) per tile
-            // Shared memory: As[16×r] + Bs[r×16] for coalesced staging
             let smem = (2 * 16 * r) as u32;
             let cfg = LaunchConfig {
-                grid_dim:         (num_tiles_n as u32, num_tiles_m as u32, 1),
+                grid_dim:         (ntn as u32, ntm as u32, 1),
                 block_dim:        (32, 1, 1),
                 shared_mem_bytes: smem,
             };
             let mut b = self.stream.launch_builder(&self.func_wmma);
-            b.arg(&d_a); b.arg(&d_b); b.arg(&mut d_c); b.arg(&mut d_m);
+            b.arg(&*d_a); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
             b.arg(&mi); b.arg(&ni); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg) }?;
         } else {
-            // DP4A: TM×TN threads per tile, dynamic shared memory
-            let warps        = (TM * TN) / 32;
-            let shared_bytes = ((TM + TN) * r + warps * 4 + 16 * 4) as u32;
+            let warps  = (TM * TN) / 32;
+            let shared = ((TM + TN) * r + warps * 4 + 16 * 4) as u32;
             let cfg = LaunchConfig {
-                grid_dim:         (num_tiles_n as u32, num_tiles_m as u32, 1),
+                grid_dim:         (ntn as u32, ntm as u32, 1),
                 block_dim:        (TN as u32, TM as u32, 1),
-                shared_mem_bytes: shared_bytes,
+                shared_mem_bytes: shared,
             };
             let mut b = self.stream.launch_builder(&self.func_dp4a);
-            b.arg(&d_a); b.arg(&d_b); b.arg(&mut d_c); b.arg(&mut d_m);
+            b.arg(&*d_a); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
             b.arg(&mi); b.arg(&ni); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg) }?;
         }
 
-        let m_states  = self.stream.clone_dtoh(&d_m)?;
+        let m_states  = self.stream.clone_dtoh(&*d_m)?;
         let threshold = difficulty_threshold(params.difficulty, r, TM, TN);
         let mut found = Vec::new();
 
-        for ti in 0..num_tiles_m {
-            for tj in 0..num_tiles_n {
-                let base = (ti * num_tiles_n + tj) * 16;
+        for ti in 0..ntm {
+            for tj in 0..ntn {
+                let base = (ti * ntn + tj) * 16;
                 let mut m_state = [0u32; 16];
                 m_state.copy_from_slice(&m_states[base..base + 16]);
                 let hash = blake3_m_hash(&m_state, s_a);
@@ -132,17 +149,12 @@ impl GpuMiner {
     }
 }
 
-/// Returns true if the GPU likely has dedicated INT8 tensor cores.
-/// GTX 16xx is sm75 but manufactured without tensor units.
 fn has_tensor_cores(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
-    // RTX series: tensor cores present
-    if n.contains("RTX") { return true; }
-    // Datacenter GPUs with tensor cores
-    if n.contains("A100") || n.contains("H100") || n.contains("H200")
-        || n.contains("V100") || n.contains("T4") || n.contains("A10")
-        || n.contains("A30") || n.contains("A40") { return true; }
-    false
+    n.contains("RTX")
+        || n.contains("A100") || n.contains("H100") || n.contains("H200")
+        || n.contains("V100") || n.contains("T4")   || n.contains("A10")
+        || n.contains("A30")  || n.contains("A40")
 }
 
 fn blake3_m_hash(m: &[u32; 16], s_a: &[u8; 32]) -> [u8; 32] {

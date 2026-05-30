@@ -24,9 +24,14 @@ pub struct Miner {
 
 impl Miner {
     pub fn new(device_ids: &[usize]) -> Result<Self, pearl_gpu::GpuError> {
+        let params = MiningParams {
+            sigma: [0u8; 32], difficulty: 32,
+            r: DEFAULT_R, k: DEFAULT_K, tm: DEFAULT_TM, tn: DEFAULT_TN,
+            m: DEFAULT_M, n: DEFAULT_N,
+        };
         let mut gpus = Vec::with_capacity(device_ids.len());
         for &id in device_ids {
-            let gpu = GpuMiner::new(id)?;
+            let gpu = GpuMiner::new(id, &params)?;
             let kernel = if gpu.info.use_wmma { "WMMA tensor cores" } else { "DP4A CUDA cores" };
             println!("[gpu:{}] {} · {} MB · {}", id, gpu.info.name, gpu.info.mem_mb, kernel);
             gpus.push(Arc::new(gpu));
@@ -73,11 +78,18 @@ impl Miner {
             // --- Pre-compute B' once per challenge (paper §4.2 optimization) ---
             let b_seed = 0xB0B0_B0B0_B0B0_B0B0u64 ^ u64::from_le_bytes(sigma[..8].try_into().unwrap());
             let b = random_matrix_i8(params.k, params.n, b_seed);
-            let b_col = transpose_i8(&b, params.k, params.n);
-            let cc    = compute_challenge(&b_col, &params);
+            let b_col   = transpose_i8(&b, params.k, params.n);
+            let cc      = compute_challenge(&b_col, &params);
             let f_noise = generate_f(params.n, params.k, params.r, &cc.s_b);
-            let b_prime = Arc::new(apply_f(&b, &f_noise, params.n, params.k));
+            let b_prime = apply_f(&b, &f_noise, params.n, params.k);
             let cc      = Arc::new(cc);
+
+            // Upload B' to each GPU once — stays resident until next challenge
+            for gpu in &self.gpus {
+                if let Err(e) = gpu.set_b(&b_prime) {
+                    eprintln!("[miner] set_b error: {e}");
+                }
+            }
 
             let new_cancel = Arc::new(AtomicBool::new(false));
             cancel = Arc::clone(&new_cancel);
@@ -90,14 +102,13 @@ impl Miner {
                 let cancel_c = Arc::clone(&new_cancel);
                 let submit_c = submit_tx.clone();
                 let hashes_c = Arc::clone(&total_hashes);
-                let b_prime_c = Arc::clone(&b_prime);
                 let cc_c     = Arc::clone(&cc);
 
                 handles.push(tokio::task::spawn_blocking(move || {
                     mining_loop(
                         &gpu_c, &params_c, &wallet_c, &seed_c,
                         gpu_idx, n_gpus,
-                        &b_prime_c, &cc_c,
+                        &cc_c,
                         cancel_c, submit_c, hashes_c,
                     );
                 }));
@@ -114,7 +125,6 @@ fn mining_loop(
     seed_hex:     &str,
     gpu_idx:      usize,
     n_gpus:       usize,
-    b_prime:      &[i8],
     cc:           &pearl_commitment::ChallengeCommitment,
     cancel:       Arc<AtomicBool>,
     submit_tx:    mpsc::Sender<Submit>,
@@ -153,7 +163,7 @@ fn mining_loop(
         t_apply += t0.elapsed().as_micros();
 
         let t0 = Instant::now();
-        match gpu.mine(&a_prime, b_prime, params, &s_a) {
+        match gpu.mine(&a_prime, params, &s_a) {
             Ok(blocks) if !blocks.is_empty() => {
                 for blk in &blocks {
                     let nonce = hex_bytes(&blk.hash);

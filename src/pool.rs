@@ -5,10 +5,13 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct PoolMessage {
-    method: String,
-    params: serde_json::Value,
+    id:     Option<u64>,
+    method: Option<String>,
+    params: Option<serde_json::Value>,
+    result: Option<serde_json::Value>,
+    error:  Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -36,12 +39,14 @@ pub async fn run(
     loop {
         println!("[pool] Connecting to {}...", addr);
         match connect(addr, wallet, password, &challenge_tx, &mut submit_rx).await {
-            Ok(()) => {} // clean close — pool resets after submit, reconnect immediately
+            Ok(()) => {
+                println!("[pool] Connection closed by server.");
+            }
             Err(e) => {
                 eprintln!("[pool] Connection error: {e}");
-                sleep(Duration::from_secs(5)).await;
             }
         }
+        sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -75,18 +80,38 @@ async fn connect(
                 if line.trim().is_empty() { continue; }
 
                 let Ok(msg) = serde_json::from_str::<PoolMessage>(&line) else {
+                    println!("[pool] <- raw: {}", line);
                     continue;
                 };
 
-                match msg.method.as_str() {
-                    "pearl.challenge" => {
-                        if let Ok(ch) = serde_json::from_value::<ChallengeParams>(msg.params) {
-                            if ch.seed == last_seed { continue; }
-                            last_seed = ch.seed.clone();
-                            let _ = challenge_tx.send(Some((ch.seed, ch.difficulty)));
+                // Check for auth response (id 1)
+                if msg.id == Some(1) {
+                    if let Some(res) = msg.result {
+                        if res.as_bool() == Some(true) {
+                            println!("[pool] Authentication successful!");
+                        } else {
+                            println!("[pool] Authentication FAILED: {:?}", res);
                         }
+                    } else if let Some(err) = msg.error {
+                        println!("[pool] Authentication ERROR: {:?}", err);
                     }
-                    _ => {}
+                    continue;
+                }
+
+                // Standard notifications
+                if let Some(method) = msg.method {
+                    match method.as_str() {
+                        "pearl.challenge" => {
+                            if let Some(p) = msg.params {
+                                if let Ok(ch) = serde_json::from_value::<ChallengeParams>(p) {
+                                    if ch.seed == last_seed { continue; }
+                                    last_seed = ch.seed.clone();
+                                    let _ = challenge_tx.send(Some((ch.seed, ch.difficulty)));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
 

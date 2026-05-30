@@ -166,8 +166,9 @@ fn mining_loop(
         };
 
         for fb in found_blocks {
-            let _nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
-            // PoUW blocks are not submitted to pearl.challenge_response.
+            let nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
+            let seed_hex: String = params.sigma.iter().map(|b| format!("{:02x}", b)).collect();
+            let _ = submit_tx.blocking_send(Submit { seed: seed_hex, nonce: nonce_hex });
         }
 
         let _ = wallet;

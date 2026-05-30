@@ -57,10 +57,8 @@ pub struct GpuMiner {
     module:       Arc<CudaModule>,
     func_dp4a:    CudaFunction,
     func_wmma:    CudaFunction,
-    func_gen_a:   CudaFunction,
     func_blake3:  CudaFunction,
     use_wmma:     bool,
-    d_a:           Mutex<CudaSlice<i8>>,   // A' (m×k)
     d_b:           Mutex<CudaSlice<i8>>,   // B' (k×n) — set once per challenge
     d_c:           Mutex<CudaSlice<i32>>,  // placeholder (kernel never writes C)
     d_m:           Mutex<CudaSlice<u32>>,  // M states (num_tiles×16)
@@ -86,7 +84,6 @@ impl GpuMiner {
 
         let func_dp4a   = module.load_function("tiled_matmul_dp4a")?;
         let func_wmma   = module.load_function("tiled_matmul_wmma")?;
-        let func_gen_a  = module.load_function("generate_noisy_a")?;
         let func_blake3 = module.load_function("blake3_check")?;
         let use_wmma    = sm >= 72;
 
@@ -95,7 +92,6 @@ impl GpuMiner {
         let num_tiles_n  = (n + TN - 1) / TN;
         let num_tiles    = num_tiles_m * num_tiles_n;
 
-        let d_a           = Mutex::new(stream.alloc_zeros::<i8>(m * k)?);
         let d_b           = Mutex::new(stream.alloc_zeros::<i8>(k * n)?);
         let d_c           = Mutex::new(stream.alloc_zeros::<i32>(1)?);
         let d_m           = Mutex::new(stream.alloc_zeros::<u32>(num_tiles * 16)?);
@@ -106,8 +102,8 @@ impl GpuMiner {
 
         Ok(Self {
             ctx, stream, module,
-            func_dp4a, func_wmma, func_gen_a, func_blake3, use_wmma,
-            d_a, d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
+            func_dp4a, func_wmma, func_blake3, use_wmma,
+            d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
             m, n, k, r, num_tiles_m, num_tiles_n,
             info: GpuInfo { name, mem_mb, use_wmma, sm },
         })
@@ -119,31 +115,12 @@ impl GpuMiner {
         Ok(())
     }
 
-    /// Generate A' = A + EL·ER entirely on GPU using splitmix64 PRNG.
-    pub fn generate_noisy_a(
-        &self,
-        job_seed: u64,
-        sa_seed:  &[u8; 32],
-        params:   &MiningParams,
-    ) -> Result<(), GpuError> {
-        let sa_u64: u64 = u64::from_le_bytes(sa_seed[..8].try_into().unwrap());
-        let (mi, ki, ri) = (params.m as i32, params.k as i32, params.r as i32);
-        let bx = 32u32; let by = 16u32;
-        let gx = (params.k as u32 + bx - 1) / bx;
-        let gy = (params.m as u32 + by - 1) / by;
-        let cfg = LaunchConfig { grid_dim: (gx, gy, 1), block_dim: (bx, by, 1), shared_mem_bytes: 0 };
-        let mut d_a = self.d_a.lock().unwrap();
-        let mut b   = self.stream.launch_builder(&self.func_gen_a);
-        b.arg(&mut *d_a); b.arg(&job_seed); b.arg(&sa_u64); b.arg(&mi); b.arg(&ki); b.arg(&ri);
-        unsafe { b.launch(cfg) }?;
-        Ok(())
-    }
-
     /// Run matmul + GPU-side BLAKE3 difficulty check. Returns found blocks and stage timings.
     pub fn mine(
         &self,
-        params: &MiningParams,
-        s_a:    &[u8; 32],
+        params:   &MiningParams,
+        job_seed: u64,
+        s_a:      &[u8; 32],
     ) -> Result<(Vec<FoundBlock>, [u128; 3]), GpuError> {
         let (m, n, k, r)     = (self.m, self.n, self.k, self.r);
         let (ntm, ntn)       = (self.num_tiles_m, self.num_tiles_n);
@@ -155,6 +132,9 @@ impl GpuMiner {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         self.stream.memcpy_htod(&sa_words, &mut *self.d_sa.lock().unwrap())?;
+
+        // sa_seed as u64 for compute_noisy_a in kernel
+        let sa_u64 = u64::from_le_bytes(s_a[..8].try_into().unwrap());
 
         // Upload threshold (8 u32 LE words)
         let thresh_bytes = difficulty_threshold(params.difficulty, r, TM, TN);
@@ -168,7 +148,6 @@ impl GpuMiner {
         self.stream.memcpy_htod(&zero, &mut *self.d_found_count.lock().unwrap())?;
 
         // Lock all buffers
-        let d_a  = self.d_a.lock().unwrap();
         let d_b  = self.d_b.lock().unwrap();
         let mut d_c = self.d_c.lock().unwrap();
         let mut d_m = self.d_m.lock().unwrap();
@@ -187,7 +166,7 @@ impl GpuMiner {
                 shared_mem_bytes: smem,
             };
             let mut b = self.stream.launch_builder(&self.func_wmma);
-            b.arg(&*d_a); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
+            b.arg(&job_seed); b.arg(&sa_u64); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
             b.arg(&mi); b.arg(&ni); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg) }?;
         } else {
@@ -199,10 +178,11 @@ impl GpuMiner {
                 shared_mem_bytes: shared,
             };
             let mut b = self.stream.launch_builder(&self.func_dp4a);
-            b.arg(&*d_a); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
+            b.arg(&job_seed); b.arg(&sa_u64); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
             b.arg(&mi); b.arg(&ni); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg) }?;
         }
+
 
         // --- BLAKE3 check kernel (on GPU, no CPU transfer needed) ---
         {

@@ -155,13 +155,9 @@ fn mining_loop(
 
         let t0 = Instant::now();
 
-        // GPU: generate A' = A + EL·ER using splitmix64 PRNG
-        if let Err(e) = gpu.generate_noisy_a(job_seed, &virtual_sa, params) {
-            eprintln!("[gpu:{gpu_idx}] generate error: {e}"); break;
-        }
-
         // GPU: tiled matmul A'·B', M-state accumulation, BLAKE3 difficulty check
-        let [t_kernel, t_dtoh, _] = match gpu.mine(params, &virtual_sa) {
+        // A' is generated on-the-fly in the MatMul kernels (PRNG fusion)
+        let [t_kernel, t_dtoh, _] = match gpu.mine(params, job_seed, &virtual_sa) {
             Ok((blocks, timing)) => { let _ = blocks; timing }
             Err(e) => { eprintln!("[gpu:{gpu_idx}] mine error: {e}"); break; }
         };

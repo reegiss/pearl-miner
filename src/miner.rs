@@ -232,25 +232,18 @@ fn check_difficulty(hash: &[u8; 32], difficulty: u32) -> bool {
 }
 
 fn solve_blake3_challenge(seed: [u8; 32], difficulty: u32, cancel: &AtomicBool) -> Option<u64> {
-    let n_cores  = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-    let n_solver = (n_cores / 2).max(2);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(n_solver)
-        .build()
-        .expect("rayon pool");
-
-    const CHUNK: u64 = 1_000_000;
+    // Use the global rayon pool (all available threads, no overhead of pool creation).
+    // GPU mining no longer uses CPU rayon for noise, so all cores are free for this.
+    const CHUNK: u64 = 4_000_000;
     let mut offset = 0u64;
     loop {
         if cancel.load(Ordering::Relaxed) { return None; }
-        let result = pool.install(|| {
-            (offset..offset + CHUNK).into_par_iter().find_any(|&nonce| {
-                if cancel.load(Ordering::Relaxed) { return false; }
-                let mut input = [0u8; 40];
-                input[..32].copy_from_slice(&seed);
-                input[32..].copy_from_slice(&nonce.to_le_bytes());
-                check_difficulty(blake3::hash(&input).as_bytes(), difficulty)
-            })
+        let result = (offset..offset + CHUNK).into_par_iter().find_any(|&nonce| {
+            if cancel.load(Ordering::Relaxed) { return false; }
+            let mut input = [0u8; 40];
+            input[..32].copy_from_slice(&seed);
+            input[32..].copy_from_slice(&nonce.to_le_bytes());
+            check_difficulty(blake3::hash(&input).as_bytes(), difficulty)
         });
         if let Some(nonce) = result { return Some(nonce); }
         offset += CHUNK;

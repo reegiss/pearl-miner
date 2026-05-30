@@ -145,25 +145,32 @@ extern "C" __global__ void tiled_matmul_wmma(
     int m, int n, int k, int r
 ) {
     /*
-     * Shared memory layout (per block = 1 warp):
-     *   As[16 × r]   — A strip for this tile, row-major, stride=r
-     *   Bs[r  × 16]  — B strip for this tile, row-major, stride=16
+     * 4 warps per block; each warp handles one 16×16 output tile.
+     * blockDim = (32, 4, 1) → 128 threads = 4 warps
+     * gridDim  = (n/16, (m+63)/64, 1)
      *
-     * All 32 lanes load As and Bs cooperatively (coalesced), then
-     * call load_matrix_sync from shared memory for each WMMA sub-step.
+     * Shared memory per block (5 × r × 16 bytes):
+     *   Bs[r × 16]          — B strip for this tile column (all 4 warps share)
+     *   As_w[4][16 × r]     — A strip per warp (each warp writes its own section)
+     *
+     * This layout gives 3-4× more warps/SM than the old 1-warp design,
+     * boosting SM occupancy from ~33% to ~100%.
      */
-    // 4-byte aligned shared memory — required for load_matrix_sync with int8_t
-    extern __shared__ int32_t smem_wmma_i32[];
-    int8_t* As = (int8_t*)smem_wmma_i32;           // 16 × r bytes
-    int8_t* Bs = (int8_t*)smem_wmma_i32 + 16 * r;  // r  × 16 bytes
+    extern __shared__ int32_t smem_wmma[];
 
-    const int tile_i      = blockIdx.y;
-    const int tile_j      = blockIdx.x;
-    const int lane        = threadIdx.x & 31;
-    const int a_row_start = tile_i * 16;
-    const int b_col_start = tile_j * 16;
+    const int warp_id    = threadIdx.y;   // 0..3
+    const int lane       = threadIdx.x;   // 0..31
+    const int tid        = warp_id * 32 + lane;
 
-    if (a_row_start >= m || b_col_start >= n) return;
+    const int tile_i     = blockIdx.y * 4 + warp_id;
+    const int tile_j     = blockIdx.x;
+    const bool active    = (tile_i * 16 < m && tile_j * 16 < n);
+    const int  a_row_base = tile_i * 16;
+    const int  b_col_base = tile_j * 16;
+
+    // Shared memory pointers
+    int8_t* Bs   = (int8_t*)smem_wmma;
+    int8_t* wAs  = Bs + r * 16 + warp_id * 16 * r;
 
     fragment<accumulator, 16, 16, 16, int32_t> acc;
     fill_fragment(acc, 0);
@@ -177,53 +184,56 @@ extern "C" __global__ void tiled_matmul_wmma(
     for (int ell = 0; ell < num_steps; ell++) {
         const int s = ell * r;
 
-        // Cooperative coalesced load: 32 threads fill 16×r and r×16 strips
-        for (int idx = lane; idx < 16 * r; idx += 32) {
-            int row = idx / r, col = idx % r;
-            int grow = a_row_start + row;
-            As[row * r + col] = (grow < m && (s + col) < k)
-                ? A[grow * k + s + col] : (int8_t)0;
-        }
-        for (int idx = lane; idx < r * 16; idx += 32) {
+        // All 128 threads cooperatively load Bs[r × 16]
+        for (int idx = tid; idx < r * 16; idx += 128) {
             int row = idx / 16, col = idx % 16;
-            int gcol = b_col_start + col;
+            int gcol = b_col_base + col;
             Bs[row * 16 + col] = ((s + row) < k && gcol < n)
                 ? B[(s + row) * n + gcol] : (int8_t)0;
         }
+        __syncthreads();  // Bs ready for all warps
+
+        // Each warp loads its own As[16 × r]
+        if (active) {
+            for (int idx = lane; idx < 16 * r; idx += 32) {
+                int row = idx / r, col = idx % r;
+                int grow = a_row_base + row;
+                wAs[idx] = (grow < m && (s + col) < k)
+                    ? A[grow * k + s + col] : (int8_t)0;
+            }
+        }
         __syncwarp();
 
-        // r/16 WMMA sub-steps, each 16×16×16 — reads from shared memory
-        const int sub_steps = r / 16;
-        for (int sub = 0; sub < sub_steps; sub++) {
-            fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
-            fragment<matrix_b, 16, 16, 16, int8_t, row_major> b_frag;
-            // As[0:16, sub*16:sub*16+16], stride = r
-            load_matrix_sync(a_frag, As + sub * 16, r);
-            // Bs[sub*16:sub*16+16, 0:16], stride = 16
-            load_matrix_sync(b_frag, Bs + sub * 16 * 16, 16);
-            mma_sync(acc, a_frag, b_frag, acc);
+        // WMMA sub-steps
+        if (active) {
+            const int sub_steps = r / 16;
+            for (int sub = 0; sub < sub_steps; sub++) {
+                fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+                fragment<matrix_b, 16, 16, 16, int8_t, row_major> b_frag;
+                load_matrix_sync(a_frag, wAs + sub * 16,       r);
+                load_matrix_sync(b_frag, Bs  + sub * 16 * 16, 16);
+                mma_sync(acc, a_frag, b_frag, acc);
+            }
+
+            uint32_t local_xor = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) local_xor ^= (uint32_t)acc.x[i];
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor, 16);
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  8);
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  4);
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  2);
+            local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  1);
+            if (lane == 0)
+                M[ell & 15] = rol32(M[ell & 15], 13) ^ local_xor;
         }
 
-        // XOR reduction across the 16×16 accumulator
-        uint32_t local_xor = 0;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) local_xor ^= (uint32_t)acc.x[i];
-        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor, 16);
-        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  8);
-        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  4);
-        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  2);
-        local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  1);
-
-        // Only lane 0 writes M — no syncwarp needed (M is private to lane 0)
-        if (lane == 0)
-            M[ell & 15] = rol32(M[ell & 15], 13) ^ local_xor;
+        __syncthreads();  // all warps done before next Bs overwrite
     }
 
-    // Store C
-    if (a_row_start < m && b_col_start < n)
-        store_matrix_sync(C + a_row_start * n + b_col_start, acc, n, mem_row_major);
+    if (!active) return;
 
-    // Store M (lane 0)
+    store_matrix_sync(C + a_row_base * n + b_col_base, acc, n, mem_row_major);
+
     if (lane == 0) {
         int num_tiles_n = (n + 15) / 16;
         int base = (tile_i * num_tiles_n + tile_j) * 16;
@@ -234,8 +244,6 @@ extern "C" __global__ void tiled_matmul_wmma(
 
 #else
 
-// Stub so the PTX always exports the symbol (called only when use_wmma=true
-// which never happens below sm_72)
 extern "C" __global__ void tiled_matmul_wmma(
     const int8_t*, const int8_t*, int32_t*, uint32_t*,
     int, int, int, int) {}

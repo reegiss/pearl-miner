@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 /// Noise for A: EL (dense m×r) + ER encoded as sparse column pairs.
 /// Each column j of ER has one +1 at row `pos[j]` and one -1 at row `neg[j]`.
 pub struct ENoise {
@@ -14,7 +16,7 @@ pub struct FNoise {
 
 /// Generate E noise from sA.
 pub fn generate_e(m: usize, k: usize, r: usize, seed: &[u8; 32]) -> ENoise {
-    let el = gen_dense(m, r, seed, 0);
+    let el      = gen_dense(m, r, seed, 0);
     let er_cols = gen_sparse_cols(k, r, seed, 1);
     ENoise { el, er_cols }
 }
@@ -29,46 +31,47 @@ pub fn generate_f(n: usize, k: usize, r: usize, seed: &[u8; 32]) -> FNoise {
 /// A' = A + EL·ER  in O(m × k × 2) — exploits ER sparsity.
 pub fn apply_e(a: &[i8], noise: &ENoise, m: usize, k: usize, r: usize) -> Vec<i8> {
     let mut out = a.to_vec();
-    for i in 0..m {
+    out.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
         let el_row = &noise.el[i * r..(i + 1) * r];
         for (j, &(pos, neg)) in noise.er_cols.iter().enumerate() {
             let e = el_row[pos as usize] as i16 - el_row[neg as usize] as i16;
-            let v = out[i * k + j] as i16 + e;
-            out[i * k + j] = v.clamp(-127, 127) as i8;
+            let v = row[j] as i16 + e;
+            row[j] = v.clamp(-127, 127) as i8;
         }
-    }
+    });
     out
 }
 
 /// B' = B + FL·FR  in O(n × k × 2) — exploits FL sparsity.
 pub fn apply_f(b: &[i8], noise: &FNoise, n: usize, k: usize) -> Vec<i8> {
     let mut out = b.to_vec();
-    for (i, &(pos, neg)) in noise.fl_rows.iter().enumerate() {
+    out.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        let (pos, neg) = noise.fl_rows[i];
         let fr_pos = &noise.fr[pos as usize * k..(pos as usize + 1) * k];
         let fr_neg = &noise.fr[neg as usize * k..(neg as usize + 1) * k];
         for j in 0..k {
             let f = fr_pos[j] as i16 - fr_neg[j] as i16;
-            let v = out[i * k + j] as i16 + f;
-            out[i * k + j] = v.clamp(-127, 127) as i8;
+            let v = row[j] as i16 + f;
+            row[j] = v.clamp(-127, 127) as i8;
         }
-    }
+    });
     out
 }
 
 // --- internal generators ---
 
 fn gen_dense(rows: usize, cols: usize, seed: &[u8; 32], domain: u8) -> Vec<i8> {
-    let mut out = Vec::with_capacity(rows * cols);
-    for i in 0..rows {
+    let mut out = vec![0i8; rows * cols];
+    out.par_chunks_mut(cols).enumerate().for_each(|(i, row_slice)| {
         for j in 0..cols {
-            out.push(prng_i6(seed, domain, i as u64, j as u64));
+            row_slice[j] = prng_i6(seed, domain, i as u64, j as u64);
         }
-    }
+    });
     out
 }
 
 fn gen_sparse_cols(k: usize, r: usize, seed: &[u8; 32], domain: u8) -> Vec<(u16, u16)> {
-    (0..k).map(|j| {
+    (0..k).into_par_iter().map(|j| {
         let pos = prng_range(seed, domain, j as u64, 0, r) as u16;
         let mut neg = prng_range(seed, domain, j as u64, 1, r) as u16;
         if neg == pos { neg = (neg + 1) % r as u16; }
@@ -77,7 +80,7 @@ fn gen_sparse_cols(k: usize, r: usize, seed: &[u8; 32], domain: u8) -> Vec<(u16,
 }
 
 fn gen_sparse_rows(n: usize, r: usize, seed: &[u8; 32], domain: u8) -> Vec<(u16, u16)> {
-    (0..n).map(|i| {
+    (0..n).into_par_iter().map(|i| {
         let pos = prng_range(seed, domain, i as u64, 0, r) as u16;
         let mut neg = prng_range(seed, domain, i as u64, 1, r) as u16;
         if neg == pos { neg = (neg + 1) % r as u16; }

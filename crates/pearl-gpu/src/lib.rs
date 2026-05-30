@@ -105,10 +105,11 @@ impl GpuMiner {
         let mut d_m = self.d_m.lock().unwrap();
 
         if self.use_wmma {
-            let smem = (2 * 16 * r) as u32;
+            // 4 warps per block: Bs (r×16) + 4 × As (16×r) = 5×r×16 bytes
+            let smem = (5 * r * 16) as u32;
             let cfg = LaunchConfig {
-                grid_dim:         (ntn as u32, ntm as u32, 1),
-                block_dim:        (32, 1, 1),
+                grid_dim:         (ntn as u32, ((ntm + 3) / 4) as u32, 1),
+                block_dim:        (32, 4, 1),
                 shared_mem_bytes: smem,
             };
             let mut b = self.stream.launch_builder(&self.func_wmma);

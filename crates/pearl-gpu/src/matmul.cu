@@ -152,9 +152,10 @@ extern "C" __global__ void tiled_matmul_wmma(
      * All 32 lanes load As and Bs cooperatively (coalesced), then
      * call load_matrix_sync from shared memory for each WMMA sub-step.
      */
-    extern __shared__ int8_t smem_wmma[];
-    int8_t* As = smem_wmma;           // 16 × r bytes
-    int8_t* Bs = smem_wmma + 16 * r;  // r  × 16 bytes
+    // 4-byte aligned shared memory — required for load_matrix_sync with int8_t
+    extern __shared__ int32_t smem_wmma_i32[];
+    int8_t* As = (int8_t*)smem_wmma_i32;           // 16 × r bytes
+    int8_t* Bs = (int8_t*)smem_wmma_i32 + 16 * r;  // r  × 16 bytes
 
     const int tile_i      = blockIdx.y;
     const int tile_j      = blockIdx.x;
@@ -213,9 +214,9 @@ extern "C" __global__ void tiled_matmul_wmma(
         local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  2);
         local_xor ^= __shfl_xor_sync(0xffffffff, local_xor,  1);
 
+        // Only lane 0 writes M — no syncwarp needed (M is private to lane 0)
         if (lane == 0)
             M[ell & 15] = rol32(M[ell & 15], 13) ^ local_xor;
-        __syncwarp();
     }
 
     // Store C

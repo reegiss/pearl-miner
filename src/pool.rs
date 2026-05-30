@@ -36,11 +36,12 @@ pub async fn run(
     loop {
         println!("[pool] Connecting to {}...", addr);
         match connect(addr, wallet, password, &challenge_tx, &mut submit_rx).await {
-            Ok(()) => println!("[pool] Connection closed."),
-            Err(e) => eprintln!("[pool] Connection error: {e}"),
+            Ok(()) => {} // clean close — pool resets after submit, reconnect immediately
+            Err(e) => {
+                eprintln!("[pool] Connection error: {e}");
+                sleep(Duration::from_secs(5)).await;
+            }
         }
-        println!("[pool] Reconnecting in 5 seconds...");
-        sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -92,30 +93,16 @@ async fn connect(
                 }
             }
 
-            // Submit a found block
+            // Submit a found block — only pearl.challenge_response
             Some(submit) = submit_rx.recv() => {
-                // Primary: pearl.challenge_response
-                let msg1 = serde_json::json!({
+                let msg = serde_json::json!({
                     "id": msg_id,
                     "method": "pearl.challenge_response",
-                    "params": {
-                        "seed":  submit.seed,
-                        "nonce": submit.nonce,
-                    }
+                    "params": { "seed": submit.seed, "nonce": submit.nonce }
                 });
                 msg_id += 1;
-
-                // Also send Stratum-style mining.submit as fallback
-                let msg2 = serde_json::json!({
-                    "id": msg_id,
-                    "method": "mining.submit",
-                    "params": [wallet, submit.seed.clone(), submit.nonce.clone()]
-                });
-                msg_id += 1;
-
-                println!("[pool] -> pearl.challenge_response nonce={}", &submit.nonce[..16]);
-                writer.write_all(format!("{msg1}\n").as_bytes()).await?;
-                writer.write_all(format!("{msg2}\n").as_bytes()).await?;
+                println!("[pool] -> submit nonce={}", &submit.nonce[..16]);
+                writer.write_all(format!("{msg}\n").as_bytes()).await?;
             }
         }
     }

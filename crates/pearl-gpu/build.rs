@@ -21,12 +21,10 @@ fn try_nvcc(cu: &str, out: &PathBuf, arch: &str) -> Option<PathBuf> {
 
 fn main() {
     println!("cargo:rerun-if-changed=src/matmul.cu");
-    println!("cargo::rustc-check-cfg=cfg(has_sm86_ptx)");
-    println!("cargo::rustc-check-cfg=cfg(has_sm89_ptx)");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let cu  = "src/matmul.cu";
 
-    // sm_75 — mandatory baseline (GTX 16xx, RTX 20xx)
+    // sm_75 — mandatory baseline (Turing: GTX 16xx, RTX 20xx)
     let ptx75 = try_nvcc(cu, &out, "sm_75")
         .expect("nvcc failed for sm_75 — ensure CUDA toolkit is on PATH");
     println!("cargo:rustc-env=MATMUL_PTX_SM75={}", ptx75.display());

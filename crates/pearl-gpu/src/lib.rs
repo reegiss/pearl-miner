@@ -22,6 +22,11 @@ pub struct GpuInfo {
     pub mem_mb:  usize,
 }
 
+/// Number of CUDA-capable devices available on this machine.
+pub fn device_count() -> usize {
+    CudaContext::device_count().unwrap_or(0) as usize
+}
+
 pub struct GpuMiner {
     #[allow(dead_code)]
     ctx:    Arc<CudaContext>,

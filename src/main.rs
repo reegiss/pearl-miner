@@ -16,8 +16,12 @@ struct Cli {
     #[arg(long, default_value = "x", help = "Pool password")]
     password: String,
 
-    #[arg(long, default_value = "0", help = "CUDA device index")]
-    gpu: usize,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "GPU device indices to use (default: all). E.g. --gpu 0,1,2"
+    )]
+    gpu: Vec<usize>,
 }
 
 #[tokio::main]
@@ -28,18 +32,28 @@ async fn main() {
 
     let args = Cli::parse();
 
-    let miner = match miner::Miner::new(args.gpu) {
+    // Resolve device list: use all GPUs if none specified
+    let device_ids: Vec<usize> = if args.gpu.is_empty() {
+        let count = pearl_gpu::device_count();
+        if count == 0 {
+            eprintln!("No CUDA devices found.");
+            std::process::exit(1);
+        }
+        (0..count).collect()
+    } else {
+        args.gpu.clone()
+    };
+
+    let miner = match miner::Miner::new(&device_ids[..]) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("Failed to initialize GPU {}: {e}", args.gpu);
+            eprintln!("Failed to initialize GPU(s): {e}");
             std::process::exit(1);
         }
     };
 
-    // challenge: pool → miner
     let (challenge_tx, challenge_rx) = watch::channel(None);
-    // submit: miner → pool
-    let (submit_tx, submit_rx) = mpsc::channel(32);
+    let (submit_tx, submit_rx)       = mpsc::channel(32);
 
     let pool_addr   = args.pool.clone();
     let pool_wallet = args.wallet.clone();

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 
-const DEFAULT_R:  usize = 128;
-const DEFAULT_K:  usize = 2048;
+const DEFAULT_R:  usize = 256;
+const DEFAULT_K:  usize = 4096;
 const DEFAULT_TM: usize = 16;
 const DEFAULT_TN: usize = 16;
 const DEFAULT_M:  usize = 8192;

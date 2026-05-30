@@ -164,9 +164,7 @@ extern "C" __global__ void generate_a_prime(
     int row = blockIdx.y * blockDim.y + threadIdx.y; // 0..m
 
     // Each block processes 16 rows. We cache 16*r elements of EL.
-    // Max r=128 supported for this shared memory optimization.
-    // If r>128, this implementation might need adjustment or dynamic smem.
-    __shared__ int8_t EL_sh[16][128]; 
+    extern __shared__ int8_t EL_sh[]; 
 
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
     int total_el = blockDim.y * r;
@@ -180,7 +178,7 @@ extern "C" __global__ void generate_a_prime(
         int grow = blockIdx.y * blockDim.y + r_idx;
         if (grow < m) {
             uint64_t s = splitmix64(base_el ^ ((uint64_t)grow * row_mul) ^ ((uint64_t)c_idx * col_mul));
-            EL_sh[r_idx][c_idx] = (int8_t)((s & 0x3F) - 32);
+            EL_sh[r_idx * r + c_idx] = (int8_t)((s & 0x3F) - 32);
         }
     }
     __syncthreads();
@@ -197,7 +195,7 @@ extern "C" __global__ void generate_a_prime(
     // Compute A
     int8_t a_val = (int8_t)((splitmix64(job_seed ^ ((uint64_t)row * row_mul) ^ ((uint64_t)col * col_mul)) & 0x7F) - 64);
     
-    int val = (int)a_val + (int)EL_sh[threadIdx.y][pos_col] - (int)EL_sh[threadIdx.y][neg_col];
+    int val = (int)a_val + (int)EL_sh[threadIdx.y * r + pos_col] - (int)EL_sh[threadIdx.y * r + neg_col];
     if (val > 127) val = 127;
     if (val < -127) val = -127;
     A_prime[row * k + col] = (int8_t)val;

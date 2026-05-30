@@ -170,10 +170,11 @@ impl GpuMiner {
             let by: u32 = 16;
             let gx = (ki as u32 + bx - 1) / bx;
             let gy = (mi as u32 + by - 1) / by;
+            let smem_gen = (by as usize * r) as u32; // Cache 16 rows of EL
             let cfg_gen = LaunchConfig {
                 grid_dim:         (gx, gy, 1),
                 block_dim:        (bx, by, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes: smem_gen,
             };
             let mut b = self.stream.launch_builder(&self.func_gen_a);
             b.arg(&mut *d_a); b.arg(&job_seed); b.arg(&sa_u64);

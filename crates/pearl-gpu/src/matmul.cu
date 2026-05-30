@@ -161,17 +161,24 @@ extern "C" __global__ void generate_el_matrix(
     int m, int r
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = m * r;
-    if (tid >= total) return;
+    const int r4 = r / 16;
+    const int total_chunks = m * r4;
+    if (tid >= total_chunks) return;
 
-    int row = tid / r;
-    int col = tid % r;
+    int grow  = tid / r4;
+    int chunk = tid % r4;
     const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
     const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
     const uint64_t base_el = sa_seed ^ 0x200ULL;
 
-    uint64_t s = splitmix64(base_el ^ ((uint64_t)row * row_mul) ^ ((uint64_t)col * col_mul));
-    EL[tid] = (int8_t)((s & 0x3F) - 32);
+    int8_t vals[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        int col = chunk * 16 + i;
+        uint64_t s = splitmix64(base_el ^ ((uint64_t)grow * row_mul) ^ ((uint64_t)col * col_mul));
+        vals[i] = (int8_t)((s & 0x3F) - 32);
+    }
+    *((int4*)EL + tid) = *((const int4*)vals);
 }
 
 /* ------------------------------------------------------------------ */
@@ -184,27 +191,37 @@ extern "C" __global__ void generate_a_prime(
     uint64_t job_seed, uint64_t sa_seed,
     int m, int k, int r
 ) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x; // 0..k
-    int row = blockIdx.y * blockDim.y + threadIdx.y; // 0..m
-    if (row >= m || col >= k) return;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k16 = k / 16;
+    const int total_chunks = m * k16;
+    if (tid >= total_chunks) return;
 
+    int row   = tid / k16;
+    int chunk = tid % k16;
     const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
     const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
+    const uint64_t base_a  = job_seed;
+    const uint64_t base_er = sa_seed ^ 0x100ULL;
 
-    // Compute ER positions for this column
-    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ ((uint64_t)col * col_mul));
-    int pos_col = (int)(er_s & (r - 1));
-    er_s = splitmix64(er_s);
-    int neg_col = (int)(er_s & (r - 1));
-    if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
+    int8_t a_prime_vals[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        int col = chunk * 16 + i;
+        
+        // Compute ER positions for this column
+        uint64_t er_s = splitmix64(base_er ^ ((uint64_t)col * col_mul));
+        int pos_col = (int)(er_s & (r - 1));
+        er_s = splitmix64(er_s);
+        int neg_col = (int)(er_s & (r - 1));
+        if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
 
-    // Compute A
-    int8_t a_val = (int8_t)((splitmix64(job_seed ^ ((uint64_t)row * row_mul) ^ ((uint64_t)col * col_mul)) & 0x7F) - 64);
-    
-    int val = (int)a_val + (int)__ldg(&EL[row * r + pos_col]) - (int)__ldg(&EL[row * r + neg_col]);
-    if (val > 127) val = 127;
-    if (val < -127) val = -127;
-    A_prime[row * k + col] = (int8_t)val;
+        // Compute A base
+        int8_t a_val = (int8_t)((splitmix64(base_a ^ ((uint64_t)row * row_mul) ^ ((uint64_t)col * col_mul)) & 0x7F) - 64);
+        
+        int val = (int)a_val + (int)__ldg(&EL[row * r + pos_col]) - (int)__ldg(&EL[row * r + neg_col]);
+        a_prime_vals[i] = (int8_t)(val > 127 ? 127 : val < -127 ? -127 : val);
+    }
+    *((int4*)A_prime + tid) = *((const int4*)a_prime_vals);
 }
 
 extern "C" __global__ void tiled_matmul_dp4a(

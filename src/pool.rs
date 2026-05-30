@@ -63,14 +63,20 @@ async fn connect(
     // Ensure worker name exists
     let worker = if wallet.contains('.') { wallet.to_string() } else { format!("{}.worker1", wallet) };
 
-    // 1. Subscribe
+    // Send Subscribe AND Authorize immediately (Stratum back-to-back)
     let subscribe = serde_json::json!({
         "id": 1,
         "method": "mining.subscribe",
-        "params": ["pearl-miner/0.1.0"]
+        "params": ["pearl-miner/0.1.0", null, addr, 0]
     });
-    writer.write_all(format!("{subscribe}\n").as_bytes()).await?;
-    println!("[pool] Connected. Subscribing...");
+    let auth = serde_json::json!({
+        "id": 2,
+        "method": "mining.authorize",
+        "params": [&worker, password]
+    });
+
+    writer.write_all(format!("{}\n{}\n", subscribe, auth).as_bytes()).await?;
+    println!("[pool] Connected. Handshaking as {}...", worker);
 
     let mut last_seed  = String::new();
     let mut msg_id: u64 = 3;
@@ -90,19 +96,11 @@ async fn connect(
                     continue;
                 };
 
-                // Check for subscribe response (id 1)
+                // Handle responses (id 1 or 2)
                 if msg.id == serde_json::json!(1) || msg.id == serde_json::json!("1") {
-                    println!("[pool] Subscribed. Authorizing as {}...", worker);
-                    let auth = serde_json::json!({
-                        "id": 2,
-                        "method": "mining.authorize",
-                        "params": [&worker, password]
-                    });
-                    writer.write_all(format!("{auth}\n").as_bytes()).await?;
+                    println!("[pool] Subscription confirmed.");
                     continue;
                 }
-
-                // Check for auth response (id 2)
                 if msg.id == serde_json::json!(2) || msg.id == serde_json::json!("2") {
                     if let Some(res) = msg.result {
                         if res.as_bool() == Some(true) || !res.is_null() {
@@ -116,7 +114,7 @@ async fn connect(
                     continue;
                 }
 
-                // Standard notifications
+                // Standard notifications (challenges)
                 if let Some(method) = msg.method {
                     match method.as_str() {
                         "pearl.challenge" => {

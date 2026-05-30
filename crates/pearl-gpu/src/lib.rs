@@ -186,7 +186,7 @@ impl GpuMiner {
         // Stage 0: Pre-compute EL matrix
         {
             let threads = 1024u32;
-            let blocks  = ((mi * ri) as u32 + threads - 1) / threads;
+            let threads = 256u32; let blocks = (((mi * ri / 16) as u32) + threads - 1) / threads;
             let cfg_el  = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
             let mut b   = self.stream.launch_builder(&self.func_gen_el);
             b.arg(&mut *d_el); b.arg(&sa_u64); b.arg(&mi); b.arg(&ri);

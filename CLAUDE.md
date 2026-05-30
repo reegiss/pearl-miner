@@ -39,7 +39,7 @@ cargo clippy --all-targets
   --pool us1.alphapool.tech:5566
 ```
 
-`pearl-gpu` requires CUDA. `build.rs` compiles `src/matmul.cu` via `nvcc -ptx -arch=sm_75` and embeds the PTX. CUDA JIT-compiles PTX to native code on first launch (then cached). To force a CUDA rebuild: `touch crates/pearl-gpu/src/matmul.cu && cargo build --release`.
+`pearl-gpu` requires CUDA. `build.rs` compiles `src/matmul.cu` for sm_75 (required), sm_86, and sm_89 (optional). The best PTX for the detected GPU is selected at runtime. To force a CUDA rebuild: `touch crates/pearl-gpu/src/matmul.cu && cargo build --release`.
 
 To build a portable binary (avoids AVX512 crashes on machines without it): `RUSTFLAGS="-C target-cpu=x86-64" cargo build --release`.
 
@@ -88,33 +88,40 @@ pool::run()  ──watch::Sender<Option<(seed_hex, difficulty)>>──▶  Miner
 1. Extract `sigma` (32 bytes) and `difficulty` from challenge
 2. Pre-compute B' = B + FL·FR once per challenge (sB doesn't depend on A — paper §4.2)
 3. Upload B' to each GPU via `GpuMiner::set_b()`
-4. Spawn: one `spawn_blocking` per GPU + one for the BLAKE3 solver
+4. Spawn: one `spawn_blocking` per GPU + one for the BLAKE3 solver (CPU)
 
 **Per GPU job (`mining_loop`):**
-- `random_matrix_i8()` → A (LCG PRNG)
-- `compute_sa(&a, cc)` → sA (2 BLAKE3 calls)
-- `generate_e(m, k, r, &sA)` → ENoise (rayon-parallel over rows)
-- `apply_e(&a, &noise)` → A' (rayon-parallel over rows)
-- `gpu.mine(&a_prime, params, &sA)` → Vec\<FoundBlock\>
+- CPU: compute `virtual_sa = blake3::keyed_hash(&cc.kappa, &job_seed.to_le_bytes())`
+- `gpu.mine(params, job_seed, &virtual_sa)` — GPU handles all matrix work internally:
+  1. `generate_el_matrix` kernel: build EL noise matrix from `virtual_sa`
+  2. `generate_a_prime` kernel: build A + apply EL·ER noise → A'
+  3. `tiled_matmul_wmma` or `tiled_matmul_dp4a`: compute A'·B', accumulate M-state
+  4. `blake3_check`: GPU-side difficulty check per tile
+  5. `solve_blake3_pool`: GPU searches for pool challenge nonce
+- Returns `(found_blocks, best_nonce, best_hash, timings)`
+- If `best_hash` meets difficulty → send `Submit { seed, nonce }` via channel
 
-Hashrate is logged every 100 jobs as `[miner] <rate> H/s · [profile/<kernel>] ...`.
+Hashrate is logged every 10 seconds from GPU 0 as `[miner] <effective> / <raw> [kernel] kernel=Xms dtoh=Xms`. Effective hashrate = raw × (r/32) to normalize across parameter sets.
 
 ## GpuMiner (crates/pearl-gpu/src/lib.rs)
 
-Pre-allocates all device buffers at construction (`d_a`, `d_b`, `d_c`, `d_m`) — each a `Mutex<CudaSlice<T>>` to satisfy cudarc 0.19's builder-pattern borrow checker.
+Pre-allocates all device buffers at construction — each a `Mutex<CudaSlice<T>>` to satisfy cudarc's builder-pattern borrow checker: `d_a`, `d_el`, `d_b`, `d_c`, `d_m`, `d_sa`, `d_threshold`, `d_found`, `d_found_count`, `d_best_nonce`, `d_best_hash`.
 
-**Kernel selection:** `has_tensor_cores(name)` checks for RTX/A100/H100/V100/T4 in GPU name → WMMA kernel. Otherwise → DP4A kernel.
+Six CUDA functions loaded at startup: `func_dp4a`, `func_wmma`, `func_blake3`, `func_gen_a`, `func_gen_el`, `func_solve_pool`.
+
+**Kernel selection:** `use_wmma = sm >= 72` — any Volta or newer uses WMMA tensor cores.
+
+**PTX compilation** (`build.rs`): sm_75 is mandatory baseline (Turing). sm_86 (Ampere/RTX 30xx) and sm_89 (Ada/RTX 40xx) are compiled if nvcc supports them and selected at runtime via `best_ptx(sm)`. Force rebuild: `touch crates/pearl-gpu/src/matmul.cu && cargo build --release`.
 
 **WMMA kernel** (`tiled_matmul_wmma` in `matmul.cu`):
 - `blockDim=(32,4)` — 4 warps per block, each warp handles one 16×16 tile
 - All 4 warps cooperatively load the shared B-strip (128 threads)
 - Grid: `(n/16, (m+63)/64)`. Shared memory: `5 × r × 16` bytes
-- Requires `sm_72+`; stub exported for sm_75 PTX but only runs on RTX cards
 
 **DP4A kernel** (`tiled_matmul_dp4a`):
 - `blockDim=(16,16)` — 8 warps per block, one tile per block
 
-**Difficulty check (CPU):** `BLAKE3(M[16 × u32], key=sA) ≤ 2^(256−b) × r × tm × tn` (little-endian uint256 comparison).
+**Difficulty check (GPU):** `blake3_check` kernel runs on-device; `solve_blake3_pool` kernel also searches for pool nonce on-device. CPU only reads back `best_nonce`/`best_hash` after sync.
 
 ## Noise Matrices (crates/pearl-noise/src/lib.rs)
 
@@ -130,16 +137,17 @@ JSON-RPC over TCP. Pool sends:
 - `pearl.challenge { seed: "<64-hex>", difficulty: <u32> }` — starts a new challenge
 - `pearl.set_mining_params` — currently ignored (hardcoded params used)
 
-Miner sends:
-- `mining.authorize [wallet, password]` — on every connect
-- `pearl.challenge_response { seed, nonce }` — BLAKE3 challenge solution
+Miner sends (on connect, back-to-back):
+- `mining.subscribe ["pearl-miner/0.1.0", null, addr, 0]` — Stratum handshake (id=1)
+- `mining.authorize [wallet_with_worker, password]` — worker auth (id=2); wallet must contain `.` or `.worker1` is appended
+- `pearl.challenge_response { seed, nonce }` — BLAKE3 challenge solution (subsequent messages)
 
 Reconnects immediately on clean close; waits 5s after errors.
 
 ## Key Constants (src/miner.rs)
 
 ```rust
-DEFAULT_R=32, DEFAULT_K=512, DEFAULT_TM=16, DEFAULT_TN=16, DEFAULT_M=1024, DEFAULT_N=1024
+DEFAULT_R=256, DEFAULT_K=4096, DEFAULT_TM=16, DEFAULT_TN=16, DEFAULT_M=8192, DEFAULT_N=8192
 ```
 
 ## Algorithm Details

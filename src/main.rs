@@ -2,6 +2,7 @@ mod miner;
 mod pool;
 
 use clap::Parser;
+use pearl_types::MiningParams;
 use tokio::sync::{mpsc, watch};
 
 #[derive(Parser)]
@@ -32,7 +33,6 @@ async fn main() {
 
     let args = Cli::parse();
 
-    // Resolve device list: use all GPUs if none specified
     let device_ids: Vec<usize> = if args.gpu.is_empty() {
         let count = pearl_gpu::device_count();
         if count == 0 {
@@ -52,15 +52,18 @@ async fn main() {
         }
     };
 
-    let (challenge_tx, challenge_rx) = watch::channel(None);
+    // challenge_tx carries (seed_hex, difficulty, job_id)
+    let (challenge_tx, challenge_rx) = watch::channel(None::<(String, u32, String)>);
+    // params_tx carries pool-assigned matrix dimensions
+    let (params_tx, params_rx)       = watch::channel(None::<MiningParams>);
     let (submit_tx, submit_rx)       = mpsc::channel(32);
 
     let pool_addr   = args.pool.clone();
     let pool_wallet = args.wallet.clone();
     let pool_pass   = args.password.clone();
     tokio::spawn(async move {
-        pool::run(&pool_addr, &pool_wallet, &pool_pass, challenge_tx, submit_rx).await;
+        pool::run(&pool_addr, &pool_wallet, &pool_pass, challenge_tx, params_tx, submit_rx).await;
     });
 
-    miner.run(args.wallet, challenge_rx, submit_tx).await;
+    miner.run(args.wallet, challenge_rx, params_rx, submit_tx).await;
 }

@@ -39,9 +39,10 @@ impl Miner {
 
     pub async fn run(
         self,
-        wallet:          String,
-        mut challenge_rx: watch::Receiver<Option<(String, u32)>>,
-        submit_tx:       mpsc::Sender<Submit>,
+        wallet:           String,
+        mut challenge_rx: watch::Receiver<Option<(String, u32, String)>>,
+        mut params_rx:    watch::Receiver<Option<MiningParams>>,
+        submit_tx:        mpsc::Sender<Submit>,
     ) {
         let n_gpus = self.gpus.len();
         println!("[miner] {} GPU(s) ready.", n_gpus);
@@ -52,7 +53,7 @@ impl Miner {
 
         loop {
             if challenge_rx.changed().await.is_err() { break; }
-            let Some((seed_hex, difficulty)) = challenge_rx.borrow().clone() else { continue; };
+            let Some((seed_hex, difficulty, job_id)) = challenge_rx.borrow().clone() else { continue; };
 
             let sigma = match hex_to_32bytes(&seed_hex) {
                 Some(s) => s,
@@ -64,25 +65,31 @@ impl Miner {
             for h in handles.drain(..) { let _ = h.await; }
 
             total_hashes.store(0, Ordering::Relaxed);
-            println!("[miner] challenge seed={}... diff={difficulty}", &seed_hex[..16]);
+            println!("[miner] challenge seed={}... diff={difficulty} job={job_id}", &seed_hex[..16]);
 
+            // Use pool-supplied matrix params when available; fall back to defaults.
+            // Note: m, n are fixed by GPU buffer allocation — only r, k, tm, tn can vary.
+            let pool_p = params_rx.borrow().clone();
             let params = Arc::new(MiningParams {
                 sigma, difficulty,
-                r: DEFAULT_R, k: DEFAULT_K,
-                tm: DEFAULT_TM, tn: DEFAULT_TN,
-                m: DEFAULT_M, n: DEFAULT_N,
+                r:  pool_p.as_ref().map(|p| p.r) .unwrap_or(DEFAULT_R),
+                k:  pool_p.as_ref().map(|p| p.k) .unwrap_or(DEFAULT_K),
+                tm: pool_p.as_ref().map(|p| p.tm).unwrap_or(DEFAULT_TM),
+                tn: pool_p.as_ref().map(|p| p.tn).unwrap_or(DEFAULT_TN),
+                m:  DEFAULT_M,
+                n:  DEFAULT_N,
             });
 
-            // --- Pre-compute B' once per challenge (paper §4.2 optimization) ---
-            let b_seed = 0xB0B0_B0B0_B0B0_B0B0u64 ^ u64::from_le_bytes(sigma[..8].try_into().unwrap());
-            let b = random_matrix_i8(params.k, params.n, b_seed);
+            // Pre-compute B' once per challenge (sB is independent of A — paper §4.2)
+            let b_seed  = 0xB0B0_B0B0_B0B0_B0B0u64 ^ u64::from_le_bytes(sigma[..8].try_into().unwrap());
+            let b       = random_matrix_i8(params.k, params.n, b_seed);
             let b_col   = transpose_i8(&b, params.k, params.n);
             let cc      = compute_challenge(&b_col, &params);
             let f_noise = generate_f(params.n, params.k, params.r, &cc.s_b);
             let b_prime = apply_f(&b, &f_noise, params.n, params.k);
             let cc      = Arc::new(cc);
 
-            // Upload B' to each GPU once — stays resident until next challenge
+            // Upload B' to each GPU — stays resident until next challenge
             for gpu in &self.gpus {
                 if let Err(e) = gpu.set_b(&b_prime) {
                     eprintln!("[miner] set_b error: {e}");
@@ -92,20 +99,24 @@ impl Miner {
             let new_cancel = Arc::new(AtomicBool::new(false));
             cancel = Arc::clone(&new_cancel);
 
-            // Spawn BLAKE3 challenge solver (CPU, rayon parallel)
+            // BLAKE3 challenge solver (CPU, rayon parallel)
             {
                 let cancel_c = Arc::clone(&new_cancel);
                 let submit_c = submit_tx.clone();
                 let seed_c   = seed_hex.clone();
+                let job_c    = job_id.clone();
                 handles.push(tokio::task::spawn_blocking(move || {
                     if let Some(nonce) = solve_blake3_challenge(sigma, difficulty, &cancel_c) {
-                        let nonce_hex = format!("{:016x}", nonce);
-                        let _ = submit_c.blocking_send(Submit { seed: seed_c, nonce: nonce_hex });
+                        let _ = submit_c.blocking_send(Submit {
+                            seed:   seed_c,
+                            nonce:  format!("{:016x}", nonce),
+                            job_id: job_c,
+                        });
                     }
                 }));
             }
 
-            // Spawn PoUW GPU mining threads
+            // PoUW GPU mining threads
             for (gpu_idx, gpu) in self.gpus.iter().enumerate() {
                 let gpu_c    = Arc::clone(gpu);
                 let params_c = Arc::clone(&params);
@@ -115,6 +126,7 @@ impl Miner {
                 let cc_c     = Arc::clone(&cc);
                 let submit_p = submit_tx.clone();
                 let seed_p   = seed_hex.clone();
+                let job_p    = job_id.clone();
 
                 handles.push(tokio::task::spawn_blocking(move || {
                     mining_loop(
@@ -122,7 +134,7 @@ impl Miner {
                         gpu_idx, n_gpus,
                         &cc_c,
                         cancel_c, hashes_c,
-                        submit_p,
+                        submit_p, seed_p, job_p,
                     );
                 }));
             }
@@ -140,11 +152,13 @@ fn mining_loop(
     cancel:       Arc<AtomicBool>,
     total_hashes: Arc<AtomicU64>,
     submit_tx:    mpsc::Sender<Submit>,
+    seed_hex:     String,
+    job_id:       String,
 ) {
-    let tiles_per_job = ((params.m / DEFAULT_TM) * (params.n / DEFAULT_TN)) as u64;
-    let mut job        = 0u64;
-    let start          = Instant::now();
-    let mut last_log   = start;
+    let tiles_per_job    = ((params.m / DEFAULT_TM) * (params.n / DEFAULT_TN)) as u64;
+    let mut job          = 0u64;
+    let start            = Instant::now();
+    let mut last_log     = start;
     let mut t_kernel_acc = 0u128;
     let mut t_dtoh_acc   = 0u128;
 
@@ -152,33 +166,29 @@ fn mining_loop(
         job += 1;
         let job_seed = (job - 1) * n_gpus as u64 + gpu_idx as u64;
 
-        // One BLAKE3 call: virtual sA seeded from challenge kappa + job counter.
-        // All heavy matrix work (A generation, noise, noise application) is on GPU.
         let virtual_sa = *blake3::keyed_hash(&cc.kappa, &job_seed.to_le_bytes()).as_bytes();
 
-        let t0 = Instant::now();
+        let (found_blocks, best_nonce, best_hash, [t_kernel, t_dtoh, _]) =
+            match gpu.mine(params, job_seed, &virtual_sa) {
+                Ok(res) => res,
+                Err(e)  => { eprintln!("[gpu:{gpu_idx}] mine error: {e}"); break; }
+            };
 
-        // GPU: tiled matmul A'·B', M-state accumulation, BLAKE3 difficulty check, pool solver
-        let (found_blocks, best_nonce, best_hash, [t_kernel, t_dtoh, _]) = match gpu.mine(params, job_seed, &virtual_sa) {
-            Ok(res) => res,
-            Err(e) => { eprintln!("[gpu:{gpu_idx}] mine error: {e}"); break; }
-        };
+        // PoUW found blocks — submission format not yet confirmed by pool
+        for _fb in found_blocks {}
 
-        for _fb in found_blocks {
-            // PoUW blocks are NOT shares for this pool.
-        }
-
-        // Check if the GPU found a share for the pool
+        // GPU pool solver found a nonce that satisfies BLAKE3 difficulty
         if check_difficulty(&best_hash, params.difficulty) {
-            let nonce_hex = format!("{:016x}", best_nonce);
-            let seed_hex: String = params.sigma.iter().map(|b| format!("{:02x}", b)).collect();
-            let _ = submit_tx.blocking_send(Submit { seed: seed_hex, nonce: nonce_hex });
+            let _ = submit_tx.blocking_send(Submit {
+                seed:   seed_hex.clone(),
+                nonce:  format!("{:016x}", best_nonce),
+                job_id: job_id.clone(),
+            });
         }
 
         let _ = wallet;
-        let _ = t0;
-        t_kernel_acc  += t_kernel;
-        t_dtoh_acc    += t_dtoh;
+        t_kernel_acc += t_kernel;
+        t_dtoh_acc   += t_dtoh;
 
         let new_total = total_hashes.fetch_add(tiles_per_job, Ordering::Relaxed) + tiles_per_job;
 
@@ -188,14 +198,11 @@ fn mining_loop(
                 let elapsed = (now - start).as_secs_f64().max(0.001);
                 let kernel  = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
                 let j = job as f64;
-                
-                // 1 Hash = 1 INT8 MAD (Multiply-Add). Each tile processes (tm * tn * k) MADs.
-                let mads_per_tile = (params.tm * params.tn * params.k) as f64;
-                let raw_mads_per_sec = (new_total as f64 * mads_per_tile) / elapsed;
-                
-                // Target multiplier normalized to baseline (r=32).
+
+                let mads_per_tile        = (params.tm * params.tn * params.k) as f64;
+                let raw_mads_per_sec     = (new_total as f64 * mads_per_tile) / elapsed;
                 let effective_mads_per_sec = raw_mads_per_sec * (params.r as f64 / 32.0);
-                
+
                 println!(
                     "[miner] {} (Effective) / {} (Raw) [{kernel}] kernel={:.1}ms dtoh={:.2}ms",
                     fmt_hashrate(effective_mads_per_sec),
@@ -214,8 +221,6 @@ fn mining_loop(
 // ────────────────────────────────────────────────────────────────────────────
 
 fn check_difficulty(hash: &[u8; 32], difficulty: u32) -> bool {
-    // Treat hash as LE uint256; need hash < 2^(256-difficulty)
-    // = top `difficulty` bits (bytes[31..] downward) must be zero
     let full_bytes = (difficulty / 8) as usize;
     let remainder  = (difficulty % 8) as u8;
     for i in 0..full_bytes {
@@ -229,8 +234,7 @@ fn check_difficulty(hash: &[u8; 32], difficulty: u32) -> bool {
 }
 
 fn solve_blake3_challenge(seed: [u8; 32], difficulty: u32, cancel: &AtomicBool) -> Option<u64> {
-    // Use half the cores so we don't starve the noise-generation rayon pool
-    let n_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let n_cores  = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     let n_solver = (n_cores / 2).max(2);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(n_solver)
@@ -310,4 +314,3 @@ fn hex_nibble(b: u8) -> Option<u8> {
         _ => None,
     }
 }
-

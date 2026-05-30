@@ -151,69 +151,51 @@ __device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
-/* ------------------------------------------------------------------ */
-/*  fill_wAs — generate A'[tile_rows][s..s+r] directly into wAs smem  */
-/*                                                                     */
-/*  Hoists ER (pos_col, neg_col) per column and increments row_part   */
-/*  additively — saves r multiplications per column.                  */
-/*  EL (m×r = 128KB) fits in the read-only L1/texture cache per SM,  */
-/*  so __ldg accesses never hit L2 in steady state.                   */
-/* ------------------------------------------------------------------ */
+// Derive a unique seed for element (row, col) from base seed
+__device__ __forceinline__ uint64_t elem_seed(uint64_t base, uint64_t row, uint64_t col) {
+    const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
+    const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
+    return splitmix64(base ^ (row * row_mul) ^ (col * col_mul));
+}
 
-__device__ __forceinline__ void fill_wAs(
-    int8_t* __restrict__       wAs,
-    const int8_t* __restrict__ EL,
-    uint64_t job_seed, uint64_t sa_seed,
-    int a_row_base, int s, int m, int r, int lane
-) {
+__device__ __forceinline__ int8_t compute_noisy_a(uint64_t job_seed, uint64_t sa_seed, int row, int col, int r) {
     const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
     const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
-    for (int col = lane; col < r; col += 32) {
-        const int global_col = s + col;
-        uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ ((uint64_t)global_col * col_mul));
-        const int pc  = (int)(er_s & (r - 1));
-        er_s          = splitmix64(er_s);
-        int nc        = (int)(er_s & (r - 1));
-        if (nc == pc) nc = (nc + 1) & (r - 1);
-        const uint64_t base_job = job_seed ^ ((uint64_t)global_col * col_mul);
-        uint64_t row_part = (uint64_t)a_row_base * row_mul;
-        #pragma unroll
-        for (int row = 0; row < 16; row++) {
-            const int grow = a_row_base + row;
-            int8_t elem = (int8_t)0;
-            if (grow < m) {
-                const int8_t a_val = (int8_t)((splitmix64(base_job ^ row_part) & 0x7F) - 64);
-                const int val = (int)a_val
-                              + (int)__ldg(&EL[grow * r + pc])
-                              - (int)__ldg(&EL[grow * r + nc]);
-                elem = (int8_t)(val > 127 ? 127 : val < -127 ? -127 : val);
-            }
-            wAs[row * r + col] = elem;
-            row_part += row_mul;
-        }
-    }
+    const uint64_t global_col_part = (uint64_t)col * col_mul;
+    const uint64_t row_part = (uint64_t)row * row_mul;
+
+    int8_t a_val = (int8_t)((splitmix64(job_seed ^ row_part ^ global_col_part) & 0x7F) - 64);
+    
+    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ global_col_part);
+    int pos_col = (int)(er_s & (r - 1));
+    er_s = splitmix64(er_s);
+    int neg_col = (int)(er_s & (r - 1));
+    if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
+
+    const uint64_t base_el = (sa_seed ^ 0x200ULL);
+    int8_t el_pos = (int8_t)((splitmix64(base_el ^ row_part ^ ((uint64_t)pos_col * col_mul)) & 0x3F) - 32);
+    int8_t el_neg = (int8_t)((splitmix64(base_el ^ row_part ^ ((uint64_t)neg_col * col_mul)) & 0x3F) - 32);
+    
+    int val = (int)a_val + (int)el_pos - (int)el_neg;
+    if (val > 127) val = 127;
+    if (val < -127) val = -127;
+    return (int8_t)val;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Kernel E: pre-compute EL noise factor matrix (m×r, 128KB)         */
-/*  Replaces the old generate_a_prime (m×k, 2MB). Called once per job */
-/*  before the matmul kernels.                                        */
+/*  Kernel 0: generate A' = A + EL·ER into global memory              */
+/*  blockDim=(32,16) — one thread per element of the m×k A' matrix.   */
 /* ------------------------------------------------------------------ */
 
-extern "C" __global__ void generate_noise_factors(
-    uint64_t        sa_seed,
-    int8_t* __restrict__ EL,
-    int m, int r
+extern "C" __global__ void generate_a_prime(
+    int8_t*  __restrict__ A_prime,
+    uint64_t job_seed, uint64_t sa_seed,
+    int m, int k, int r
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= m * r) return;
-    const int row = idx / r, col = idx % r;
-    const uint64_t s = splitmix64(
-        (sa_seed ^ 0x200ULL)
-        ^ ((uint64_t)row * 0x9e3779b97f4a7c15ULL)
-        ^ ((uint64_t)col * 0xd1b54a32d192ed03ULL)
-    );
-    EL[idx] = (int8_t)((s & 0x3F) - 32);
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= m || col >= k) return;
+    A_prime[row * k + col] = compute_noisy_a(job_seed, sa_seed, row, col, r);
 }
 
 /* ------------------------------------------------------------------ */
@@ -221,9 +203,7 @@ extern "C" __global__ void generate_noise_factors(
 /* ------------------------------------------------------------------ */
 
 extern "C" __global__ void tiled_matmul_dp4a(
-    uint64_t      job_seed,
-    uint64_t      sa_seed,
-    const int8_t* __restrict__ EL,
+    const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     int32_t*      __restrict__ C,
     uint32_t*     __restrict__ M_out,
@@ -255,29 +235,13 @@ extern "C" __global__ void tiled_matmul_dp4a(
         const int s = ell * r;
 
         {
-            const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
-            const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
-            const int total = TM * r;
+            int total = TM * r;
             for (int idx = tid; idx < total; idx += TM * TN) {
-                const int row = idx / r, col = idx % r;
-                const int grow = tile_i * TM + row;
-                const int global_col = s + col;
-                if (grow < m && global_col < k) {
-                    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ ((uint64_t)global_col * col_mul));
-                    const int pc  = (int)(er_s & (r - 1));
-                    er_s          = splitmix64(er_s);
-                    int nc        = (int)(er_s & (r - 1));
-                    if (nc == pc) nc = (nc + 1) & (r - 1);
-                    const int8_t a_val = (int8_t)((splitmix64(
-                        job_seed ^ ((uint64_t)global_col * col_mul) ^
-                        ((uint64_t)grow * row_mul)) & 0x7F) - 64);
-                    const int val = (int)a_val
-                                  + (int)__ldg(&EL[grow * r + pc])
-                                  - (int)__ldg(&EL[grow * r + nc]);
-                    As[idx] = (int8_t)(val > 127 ? 127 : val < -127 ? -127 : val);
-                } else {
-                    As[idx] = (int8_t)0;
-                }
+                int row = idx / r, col = idx % r;
+                int grow = tile_i * TM + row;
+                int gcol = s + col;
+                As[idx] = (grow < m && gcol < k)
+                    ? __ldg(&A[grow * k + gcol]) : (int8_t)0;
             }
         }
         {
@@ -382,12 +346,8 @@ __device__ __forceinline__ void cp_async_wait0() {
 #include <mma.h>
 using namespace nvcuda::wmma;
 
-extern "C" __global__
-__launch_bounds__(256, 4)
-void tiled_matmul_wmma(
-    uint64_t      job_seed,
-    uint64_t      sa_seed,
-    const int8_t* __restrict__ EL,
+extern "C" __global__ void tiled_matmul_wmma(
+    const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     int32_t*      __restrict__ C,
     uint32_t*     __restrict__ M_out,
@@ -430,6 +390,8 @@ void tiled_matmul_wmma(
 
     const int  num_steps  = k / r;
     const bool b_full_col = (b_col_base + 15 < n);
+    const int  valid_rows = active ? min(16, m - a_row_base) : 0;
+    const int  r4         = r / 16;
 
 #if __CUDA_ARCH__ >= 800
     /* ---- sm_80+ double-buffer path --------------------------------- */
@@ -470,9 +432,14 @@ void tiled_matmul_wmma(
         cp_async_commit();  // all threads commit (empty for warps 1-7)
 
         if (active) {
-            // Generate A'[tile_rows][s..s+r] on-the-fly into wAs.
-            // Runs concurrently with the B[ell+1] cp.async prefetch above.
-            fill_wAs(wAs, EL, job_seed, sa_seed, a_row_base, s, m, r, lane);
+            // A-strip: int4 loads [concurrent with B prefetch above]
+            for (int q = lane; q < 16 * r4; q += 32) {
+                const int row = q / r4, chunk = q % r4;
+                int4* dst = (int4*)wAs + q;
+                *dst = (row < valid_rows)
+                    ? __ldg((const int4*)(A + (a_row_base + row) * k + s) + chunk)
+                    : make_int4(0, 0, 0, 0);
+            }
             __syncwarp();
 
             const int sub_steps = r / 32;
@@ -525,7 +492,13 @@ void tiled_matmul_wmma(
         __syncthreads();
 
         if (active) {
-            fill_wAs(wAs, EL, job_seed, sa_seed, a_row_base, s, m, r, lane);
+            for (int q = lane; q < 16 * r4; q += 32) {
+                const int row = q / r4, chunk = q % r4;
+                int4* dst = (int4*)wAs + q;
+                *dst = (row < valid_rows)
+                    ? __ldg((const int4*)(A + (a_row_base + row) * k + s) + chunk)
+                    : make_int4(0, 0, 0, 0);
+            }
             __syncwarp();
 
             const int sub_steps = r / 16;
@@ -566,7 +539,7 @@ void tiled_matmul_wmma(
 #else
 
 extern "C" __global__ void tiled_matmul_wmma(
-    uint64_t, uint64_t, const int8_t*, const int8_t*,
-    int32_t*, uint32_t*, int, int, int, int) {}
+    const int8_t*, const int8_t*, int32_t*, uint32_t*,
+    int, int, int, int) {}
 
 #endif  // __CUDA_ARCH__ >= 720

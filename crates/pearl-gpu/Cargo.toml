@@ -8,6 +8,7 @@ build = "build.rs"
 cudarc      = { version = "0.19", features = ["driver", "cuda-12000"] }
 blake3      = "1"
 pearl-types = { path = "../pearl-types" }
+rayon       = "1"
 thiserror   = "1"
 
 [build-dependencies]

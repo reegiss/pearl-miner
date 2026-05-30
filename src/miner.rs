@@ -64,7 +64,7 @@ impl Miner {
             for h in handles.drain(..) { let _ = h.await; }
 
             total_hashes.store(0, Ordering::Relaxed);
-            println!("[pool] challenge seed={} difficulty={difficulty}", &seed_hex[..16]);
+            println!("[miner] challenge seed={}... diff={difficulty}", &seed_hex[..16]);
 
             let params = Arc::new(MiningParams {
                 sigma, difficulty,
@@ -111,14 +111,13 @@ impl Miner {
                 let gpu_c    = Arc::clone(gpu);
                 let params_c = Arc::clone(&params);
                 let wallet_c = wallet.clone();
-                let seed_c   = seed_hex.clone();
                 let cancel_c = Arc::clone(&new_cancel);
                 let hashes_c = Arc::clone(&total_hashes);
                 let cc_c     = Arc::clone(&cc);
 
                 handles.push(tokio::task::spawn_blocking(move || {
                     mining_loop(
-                        &gpu_c, &params_c, &wallet_c, &seed_c,
+                        &gpu_c, &params_c, &wallet_c,
                         gpu_idx, n_gpus,
                         &cc_c,
                         cancel_c, hashes_c,
@@ -129,12 +128,10 @@ impl Miner {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn mining_loop(
     gpu:          &GpuMiner,
     params:       &MiningParams,
     wallet:       &str,
-    seed_hex:     &str,
     gpu_idx:      usize,
     n_gpus:       usize,
     cc:           &pearl_commitment::ChallengeCommitment,
@@ -145,9 +142,7 @@ fn mining_loop(
     let mut job        = 0u64;
     let start          = Instant::now();
     let mut last_log   = start;
-
-    // Profiling accumulator (µs)
-    let mut t_gpu = 0u128;
+    let mut t_gpu      = 0u128;
 
     while !cancel.load(Ordering::Relaxed) {
         job += 1;
@@ -181,21 +176,19 @@ fn mining_loop(
 
         let new_total = total_hashes.fetch_add(tiles_per_job, Ordering::Relaxed) + tiles_per_job;
 
-        // GPU 0 logs combined hashrate every 100 jobs
-        if gpu_idx == 0 && job % 100 == 0 {
-            let now     = Instant::now();
-            let elapsed = (now - start).as_secs_f64().max(0.001);
-            let kernel  = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
-            println!(
-                "[miner] {} · seed={} · job={} [{kernel}] gpu={:.2}ms/job",
-                fmt_hashrate(new_total as f64 / elapsed),
-                &seed_hex[..16],
-                job * n_gpus as u64,
-                t_gpu as f64 / job as f64 / 1000.0,
-            );
-            last_log = now;
+        if gpu_idx == 0 {
+            let now = Instant::now();
+            if (now - last_log).as_secs_f64() >= 5.0 {
+                let elapsed = (now - start).as_secs_f64().max(0.001);
+                let kernel  = if gpu.info.use_wmma { "wmma" } else { "dp4a" };
+                println!(
+                    "[miner] {} [{kernel}] {:.1}ms/job",
+                    fmt_hashrate(new_total as f64 / elapsed),
+                    t_gpu as f64 / job as f64 / 1000.0,
+                );
+                last_log = now;
+            }
         }
-        let _ = last_log;
     }
 }
 

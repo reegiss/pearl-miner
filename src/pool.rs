@@ -83,13 +83,10 @@ async fn connect(
                         if let Ok(ch) = serde_json::from_value::<ChallengeParams>(msg.params) {
                             if ch.seed == last_seed { continue; }
                             last_seed = ch.seed.clone();
-                            println!("[pool] New challenge: seed={} difficulty={}", ch.seed, ch.difficulty);
                             let _ = challenge_tx.send(Some((ch.seed, ch.difficulty)));
                         }
                     }
-                    other => {
-                        println!("[pool] <- {other}");
-                    }
+                    _ => {}
                 }
             }
 

@@ -1,6 +1,7 @@
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use pearl_types::{FoundBlock, MiningParams};
+use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -150,19 +151,21 @@ impl GpuMiner {
 
         let m_states  = self.stream.clone_dtoh(&*d_m)?;
         let threshold = difficulty_threshold(params.difficulty, r, TM, TN);
-        let mut found = Vec::new();
+        let num_tiles = ntm * ntn;
 
-        for ti in 0..ntm {
-            for tj in 0..ntn {
-                let base = (ti * ntn + tj) * 16;
-                let mut m_state = [0u32; 16];
-                m_state.copy_from_slice(&m_states[base..base + 16]);
-                let hash = blake3_m_hash(&m_state, s_a);
-                if hash_le_threshold(&hash, &threshold) {
-                    found.push(FoundBlock { tile_i: ti * TM, tile_j: tj * TN, m_state, hash });
-                }
+        let found: Vec<FoundBlock> = (0..num_tiles).into_par_iter().filter_map(|idx| {
+            let ti = idx / ntn;
+            let tj = idx % ntn;
+            let base = idx * 16;
+            let mut m_state = [0u32; 16];
+            m_state.copy_from_slice(&m_states[base..base + 16]);
+            let hash = blake3_m_hash(&m_state, s_a);
+            if hash_le_threshold(&hash, &threshold) {
+                Some(FoundBlock { tile_i: ti * TM, tile_j: tj * TN, m_state, hash })
+            } else {
+                None
             }
-        }
+        }).collect();
 
         Ok(found)
     }

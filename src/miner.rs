@@ -162,15 +162,7 @@ fn mining_loop(
 
         // GPU: tiled matmul A'·B', M-state accumulation, BLAKE3 difficulty check
         let [t_kernel, t_dtoh, _] = match gpu.mine(params, &virtual_sa) {
-            Ok((blocks, timing)) => {
-                for blk in &blocks {
-                    println!(
-                        "[PoUW] gpu:{gpu_idx} tile=({},{}) hash={}",
-                        blk.tile_i, blk.tile_j, &hex_bytes(&blk.hash)[..16],
-                    );
-                }
-                timing
-            }
+            Ok((blocks, timing)) => { let _ = blocks; timing }
             Err(e) => { eprintln!("[gpu:{gpu_idx}] mine error: {e}"); break; }
         };
         let _ = wallet;
@@ -300,6 +292,3 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn hex_bytes(b: &[u8]) -> String {
-    b.iter().map(|v| format!("{v:02x}")).collect()
-}

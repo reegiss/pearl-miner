@@ -114,6 +114,8 @@ impl Miner {
                 let cancel_c = Arc::clone(&new_cancel);
                 let hashes_c = Arc::clone(&total_hashes);
                 let cc_c     = Arc::clone(&cc);
+                let submit_p = submit_tx.clone();
+                let seed_p   = seed_hex.clone();
 
                 handles.push(tokio::task::spawn_blocking(move || {
                     mining_loop(
@@ -121,6 +123,7 @@ impl Miner {
                         gpu_idx, n_gpus,
                         &cc_c,
                         cancel_c, hashes_c,
+                        submit_p,
                     );
                 }));
             }
@@ -137,6 +140,7 @@ fn mining_loop(
     cc:           &pearl_commitment::ChallengeCommitment,
     cancel:       Arc<AtomicBool>,
     total_hashes: Arc<AtomicU64>,
+    submit_tx:    mpsc::Sender<Submit>,
 ) {
     let tiles_per_job = ((params.m / DEFAULT_TM) * (params.n / DEFAULT_TN)) as u64;
     let mut job        = 0u64;
@@ -164,8 +168,9 @@ fn mining_loop(
 
         for fb in found_blocks {
             let nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
+            let seed_hex: String = params.sigma.iter().map(|b| format!("{:02x}", b)).collect();
             println!("[PoUW] Found block! hash={}", &nonce_hex[..16]);
-            let _ = submit_tx.blocking_send(Submit { seed: cc.seed.clone(), nonce: nonce_hex });
+            let _ = submit_tx.blocking_send(Submit { seed: seed_hex, nonce: nonce_hex });
         }
 
         let _ = wallet;

@@ -183,12 +183,27 @@ __device__ __forceinline__ int8_t compute_noisy_a(uint64_t job_seed, uint64_t sa
 }
 
 /* ------------------------------------------------------------------ */
+/*  Kernel 0: generate A' = A + EL·ER into global memory              */
+/*  blockDim=(32,16) — one thread per element of the m×k A' matrix.   */
+/* ------------------------------------------------------------------ */
+
+extern "C" __global__ void generate_a_prime(
+    int8_t*  __restrict__ A_prime,
+    uint64_t job_seed, uint64_t sa_seed,
+    int m, int k, int r
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= m || col >= k) return;
+    A_prime[row * k + col] = compute_noisy_a(job_seed, sa_seed, row, col, r);
+}
+
+/* ------------------------------------------------------------------ */
 /*  Kernel A: DP4A (CUDA cores, sm_61+)                                */
 /* ------------------------------------------------------------------ */
 
 extern "C" __global__ void tiled_matmul_dp4a(
-    uint64_t      job_seed,
-    uint64_t      sa_seed,
+    const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     int32_t*      __restrict__ C,
     uint32_t*     __restrict__ M_out,
@@ -220,47 +235,13 @@ extern "C" __global__ void tiled_matmul_dp4a(
         const int s = ell * r;
 
         {
-            // Optimized A-matrix loading: hoist ER noise calculation per column
-            const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
-            const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
-            const uint64_t base_el  = (sa_seed ^ 0x200ULL);
-
-            int last_col = -1;
-            uint64_t base_job, pos_part, neg_part;
-            int pos_col, neg_col;
-
             int total = TM * r;
             for (int idx = tid; idx < total; idx += TM * TN) {
                 int row = idx / r, col = idx % r;
-                if (col != last_col) {
-                    const int global_col = s + col;
-                    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ ((uint64_t)global_col * col_mul));
-                    pos_col = (int)(er_s & (r - 1));
-                    er_s = splitmix64(er_s);
-                    neg_col = (int)(er_s & (r - 1));
-                    if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
-
-                    base_job = job_seed ^ ((uint64_t)global_col * col_mul);
-                    pos_part = (uint64_t)pos_col * col_mul;
-                    neg_part = (uint64_t)neg_col * col_mul;
-                    last_col = col;
-                }
-
                 int grow = tile_i * TM + row;
-                const int global_col = s + col;
-                if (grow < m && global_col < k) {
-                    uint64_t row_part = (uint64_t)grow * row_mul;
-                    int8_t a_val = (int8_t)((splitmix64(base_job ^ row_part) & 0x7F) - 64);
-                    int8_t el_pos = (int8_t)((splitmix64(base_el ^ row_part ^ pos_part) & 0x3F) - 32);
-                    int8_t el_neg = (int8_t)((splitmix64(base_el ^ row_part ^ neg_part) & 0x3F) - 32);
-                    
-                    int val = (int)a_val + (int)el_pos - (int)el_neg;
-                    if (val > 127) val = 127;
-                    if (val < -127) val = -127;
-                    As[idx] = (int8_t)val;
-                } else {
-                    As[idx] = (int8_t)0;
-                }
+                int gcol = s + col;
+                As[idx] = (grow < m && gcol < k)
+                    ? __ldg(&A[grow * k + gcol]) : (int8_t)0;
             }
         }
         {
@@ -333,8 +314,7 @@ extern "C" __global__ void tiled_matmul_dp4a(
 using namespace nvcuda::wmma;
 
 extern "C" __global__ void tiled_matmul_wmma(
-    uint64_t      job_seed,
-    uint64_t      sa_seed,
+    const int8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     int32_t*      __restrict__ C,
     uint32_t*     __restrict__ M_out,
@@ -362,22 +342,16 @@ extern "C" __global__ void tiled_matmul_wmma(
     #pragma unroll
     for (int q = 0; q < 16; q++) M[q] = 0;
 
-    const int num_steps = k / r;
-
-    // Hoist loop-invariant bounds: b_col_base and a_row_base are fixed per block/warp.
-    // b_full_col: all 16 B columns are in-bounds (true for all non-edge N-tiles).
-    // valid_rows: how many A rows are in-bounds for this warp's M-tile.
+    const int num_steps  = k / r;
     const bool b_full_col = (b_col_base + 15 < n);
+    const int  valid_rows = active ? min(16, m - a_row_base) : 0;
 
     for (int ell = 0; ell < num_steps; ell++) {
         const int s = ell * r;
 
-        // B-strip load: thread tid loads row `tid` of the r×16 B-strip using a
-        // 128-bit int4 load (16 bytes per thread).  Only `r` threads participate;
-        // s+tid < k is guaranteed because ell < k/r ensures s+r <= k.
-        // B pointer is always 16-byte aligned: B is CUDA-allocated (256-byte
-        // alignment), each row is n bytes (n=1024, multiple of 16), and
-        // b_col_base = tile_j*16 is a multiple of 16.
+        // B-strip: 128-bit __ldg loads, only r threads participate.
+        // Alignment guaranteed: B is CUDA-allocated (256-byte aligned),
+        // each row is n bytes (multiple of 16), b_col_base = tile_j*16.
         if (tid < r) {
             if (b_full_col) {
                 *((int4*)(Bs + tid * 16)) =
@@ -391,44 +365,16 @@ extern "C" __global__ void tiled_matmul_wmma(
         __syncthreads();
 
         if (active) {
-            // A-strip: hoist ER noise per column (pos_col/neg_col identical for all rows),
-            // then loop over 16 rows reusing those values — saves 15 splitmix64 calls/col.
-            const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
-            const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
-            const uint64_t base_el = (sa_seed ^ 0x200ULL);
-
-            for (int c_off = 0; c_off < r; c_off += 32) {
-                int col = c_off + lane;
-                if (col < r) {
-                    const int global_col = s + col;
-                    uint64_t er_s = splitmix64((sa_seed ^ 0x100ULL) ^ ((uint64_t)global_col * col_mul));
-                    int pos_col = (int)(er_s & (r - 1));
-                    er_s = splitmix64(er_s);
-                    int neg_col = (int)(er_s & (r - 1));
-                    if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
-
-                    const uint64_t base_job = job_seed ^ ((uint64_t)global_col * col_mul);
-                    const uint64_t pos_part = (uint64_t)pos_col * col_mul;
-                    const uint64_t neg_part = (uint64_t)neg_col * col_mul;
-
-                    #pragma unroll
-                    for (int row = 0; row < 16; row++) {
-                        int grow = a_row_base + row;
-                        if (grow < m) {
-                            uint64_t row_part = (uint64_t)grow * row_mul;
-                            int8_t a_val  = (int8_t)((splitmix64(base_job ^ row_part) & 0x7F) - 64);
-                            int8_t el_pos = (int8_t)((splitmix64(base_el ^ row_part ^ pos_part) & 0x3F) - 32);
-                            int8_t el_neg = (int8_t)((splitmix64(base_el ^ row_part ^ neg_part) & 0x3F) - 32);
-                            int val = (int)a_val + (int)el_pos - (int)el_neg;
-                            if (val > 127) val = 127;
-                            if (val < -127) val = -127;
-                            wAs[row * r + col] = (int8_t)val;
-                        } else {
-                            wAs[row * r + col] = (int8_t)0;
-                        }
-                    }
-                }
+            // A-strip: row-by-row __ldg loads (coalesced), A' already in global mem.
+            // s+c < k always holds: ell < k/r guarantees s+r <= k.
+            for (int row = 0; row < valid_rows; row++) {
+                const int8_t* Arow = A + (a_row_base + row) * k + s;
+                for (int c = lane; c < r; c += 32)
+                    wAs[row * r + c] = __ldg(&Arow[c]);
             }
+            for (int row = valid_rows; row < 16; row++)
+                for (int c = lane; c < r; c += 32)
+                    wAs[row * r + c] = (int8_t)0;
             __syncwarp();
 
             const int sub_steps = r / 16;
@@ -468,7 +414,7 @@ extern "C" __global__ void tiled_matmul_wmma(
 #else
 
 extern "C" __global__ void tiled_matmul_wmma(
-    uint64_t, uint64_t, const int8_t*, int32_t*, uint32_t*,
+    const int8_t*, const int8_t*, int32_t*, uint32_t*,
     int, int, int, int) {}
 
 #endif

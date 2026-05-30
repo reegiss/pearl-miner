@@ -58,7 +58,9 @@ pub struct GpuMiner {
     func_dp4a:    CudaFunction,
     func_wmma:    CudaFunction,
     func_blake3:  CudaFunction,
+    func_gen_a:   CudaFunction,
     use_wmma:     bool,
+    d_a:           Mutex<CudaSlice<i8>>,   // A' (m×k) — regenerated each job on GPU
     d_b:           Mutex<CudaSlice<i8>>,   // B' (k×n) — set once per challenge
     d_c:           Mutex<CudaSlice<i32>>,  // placeholder (kernel never writes C)
     d_m:           Mutex<CudaSlice<u32>>,  // M states (num_tiles×16)
@@ -85,6 +87,7 @@ impl GpuMiner {
         let func_dp4a   = module.load_function("tiled_matmul_dp4a")?;
         let func_wmma   = module.load_function("tiled_matmul_wmma")?;
         let func_blake3 = module.load_function("blake3_check")?;
+        let func_gen_a  = module.load_function("generate_a_prime")?;
         let use_wmma    = sm >= 72;
 
         let (m, n, k, r) = (params.m, params.n, params.k, params.r);
@@ -92,6 +95,7 @@ impl GpuMiner {
         let num_tiles_n  = (n + TN - 1) / TN;
         let num_tiles    = num_tiles_m * num_tiles_n;
 
+        let d_a           = Mutex::new(stream.alloc_zeros::<i8>(m * k)?);
         let d_b           = Mutex::new(stream.alloc_zeros::<i8>(k * n)?);
         let d_c           = Mutex::new(stream.alloc_zeros::<i32>(1)?);
         let d_m           = Mutex::new(stream.alloc_zeros::<u32>(num_tiles * 16)?);
@@ -102,8 +106,8 @@ impl GpuMiner {
 
         Ok(Self {
             ctx, stream, module,
-            func_dp4a, func_wmma, func_blake3, use_wmma,
-            d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
+            func_dp4a, func_wmma, func_blake3, func_gen_a, use_wmma,
+            d_a, d_b, d_c, d_m, d_sa, d_threshold, d_found, d_found_count,
             m, n, k, r, num_tiles_m, num_tiles_n,
             info: GpuInfo { name, mem_mb, use_wmma, sm },
         })
@@ -148,6 +152,7 @@ impl GpuMiner {
         self.stream.memcpy_htod(&zero, &mut *self.d_found_count.lock().unwrap())?;
 
         // Lock all buffers
+        let mut d_a = self.d_a.lock().unwrap();
         let d_b  = self.d_b.lock().unwrap();
         let mut d_c = self.d_c.lock().unwrap();
         let mut d_m = self.d_m.lock().unwrap();
@@ -158,6 +163,25 @@ impl GpuMiner {
 
         // --- Matmul kernel ---
         let t_kernel_start = std::time::Instant::now();
+
+        // Stage 1: generate A' = A + EL·ER on GPU (dedicated low-register kernel)
+        {
+            let bx: u32 = 32;
+            let by: u32 = 16;
+            let gx = (ki as u32 + bx - 1) / bx;
+            let gy = (mi as u32 + by - 1) / by;
+            let cfg_gen = LaunchConfig {
+                grid_dim:         (gx, gy, 1),
+                block_dim:        (bx, by, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = self.stream.launch_builder(&self.func_gen_a);
+            b.arg(&mut *d_a); b.arg(&job_seed); b.arg(&sa_u64);
+            b.arg(&mi); b.arg(&ki); b.arg(&ri);
+            unsafe { b.launch(cfg_gen) }?;
+        }
+
+        // Stage 2: tiled matmul A'·B' + M-state accumulation
         if self.use_wmma {
             let smem = (9 * r * 16) as u32;
             let cfg = LaunchConfig {
@@ -166,7 +190,7 @@ impl GpuMiner {
                 shared_mem_bytes: smem,
             };
             let mut b = self.stream.launch_builder(&self.func_wmma);
-            b.arg(&job_seed); b.arg(&sa_u64); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
+            b.arg(&*d_a); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
             b.arg(&mi); b.arg(&ni); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg) }?;
         } else {
@@ -178,7 +202,7 @@ impl GpuMiner {
                 shared_mem_bytes: shared,
             };
             let mut b = self.stream.launch_builder(&self.func_dp4a);
-            b.arg(&job_seed); b.arg(&sa_u64); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
+            b.arg(&*d_a); b.arg(&*d_b); b.arg(&mut *d_c); b.arg(&mut *d_m);
             b.arg(&mi); b.arg(&ni); b.arg(&ki); b.arg(&ri);
             unsafe { b.launch(cfg) }?;
         }

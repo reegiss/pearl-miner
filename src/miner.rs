@@ -166,13 +166,9 @@ fn mining_loop(
         };
 
         for fb in found_blocks {
-            // Anti-flood: only submit ~10% of PoUW tiles as shares to prevent pool disconnects.
-            // This still proves our hashrate without overwhelming the connection.
-            if (fb.tile_i + fb.tile_j) % 10 == 0 {
-                let nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
-                let seed_hex: String = params.sigma.iter().map(|b| format!("{:02x}", b)).collect();
-                let _ = submit_tx.blocking_send(Submit { seed: seed_hex, nonce: nonce_hex });
-            }
+            let _nonce_hex: String = fb.hash.iter().map(|b| format!("{:02x}", b)).collect();
+            // PoUW blocks are NOT shares for this pool.
+            // Sending them causes "Connection closed by server".
         }
 
         let _ = wallet;

@@ -345,6 +345,7 @@ extern "C" __global__ void tiled_matmul_wmma(
     const int num_steps  = k / r;
     const bool b_full_col = (b_col_base + 15 < n);
     const int  valid_rows = active ? min(16, m - a_row_base) : 0;
+    const int  r4         = r / 16;  // int4 chunks per A-strip row (r%16==0 always)
 
     for (int ell = 0; ell < num_steps; ell++) {
         const int s = ell * r;
@@ -365,16 +366,18 @@ extern "C" __global__ void tiled_matmul_wmma(
         __syncthreads();
 
         if (active) {
-            // A-strip: row-by-row __ldg loads (coalesced), A' already in global mem.
-            // s+c < k always holds: ell < k/r guarantees s+r <= k.
-            for (int row = 0; row < valid_rows; row++) {
-                const int8_t* Arow = A + (a_row_base + row) * k + s;
-                for (int c = lane; c < r; c += 32)
-                    wAs[row * r + c] = __ldg(&Arow[c]);
+            // Load 16×r A-strip via int4 (16-byte) loads — 1 pass for r=32, 2 for r=64.
+            // Alignment guaranteed: CUDA alloc (256B aligned), s=ell*r (r%16==0), row*k (k%r==0).
+            for (int q = lane; q < 16 * r4; q += 32) {
+                const int row   = q / r4;
+                const int chunk = q % r4;
+                int4* dst = (int4*)wAs + q;
+                if (row < valid_rows) {
+                    *dst = __ldg((const int4*)(A + (a_row_base + row) * k + s) + chunk);
+                } else {
+                    *dst = make_int4(0, 0, 0, 0);
+                }
             }
-            for (int row = valid_rows; row < 16; row++)
-                for (int c = lane; c < r; c += 32)
-                    wAs[row * r + c] = (int8_t)0;
             __syncwarp();
 
             const int sub_steps = r / 16;

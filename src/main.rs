@@ -54,8 +54,10 @@ async fn main() {
         }
     };
 
-    // GPU 0 is shared with pool for BLAKE3 challenge solving
-    let pool_gpu = match GpuMiner::new(device_ids[0], &pearl_types::MiningParams {
+    // Pool GPU uses the LAST device to avoid contention with mining GPU 0.
+    // If only 1 GPU available, they share device 0.
+    let pool_device = *device_ids.last().unwrap();
+    let pool_gpu = match GpuMiner::new(pool_device, &pearl_types::MiningParams {
         sigma: [0u8; 32], difficulty: 32,
         r: 256, k: 4096, tm: 16, tn: 16, m: 8192, n: 8192,
     }) {

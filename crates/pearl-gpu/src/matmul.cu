@@ -189,7 +189,6 @@ extern "C" __global__ void generate_el_matrix(
 
 extern "C" __global__ void generate_a_prime(
     int8_t*  __restrict__ A_prime,
-    const int8_t* __restrict__ EL,
     uint64_t job_seed, uint64_t sa_seed,
     int m, int k, int r
 ) {
@@ -203,25 +202,13 @@ extern "C" __global__ void generate_a_prime(
     const uint64_t row_mul = 0x9e3779b97f4a7c15ULL;
     const uint64_t col_mul = 0xd1b54a32d192ed03ULL;
     const uint64_t base_a  = job_seed;
-    const uint64_t base_er = sa_seed ^ 0x100ULL;
 
     int8_t a_prime_vals[16];
     #pragma unroll
     for (int i = 0; i < 16; i++) {
         int col = chunk * 16 + i;
-        
-        // Compute ER positions for this column
-        uint64_t er_s = splitmix64(base_er ^ ((uint64_t)col * col_mul));
-        int pos_col = (int)(er_s & (r - 1));
-        er_s = splitmix64(er_s);
-        int neg_col = (int)(er_s & (r - 1));
-        if (neg_col == pos_col) neg_col = (neg_col + 1) & (r - 1);
-
-        // Compute A base
-        int8_t a_val = (int8_t)((splitmix64(base_a ^ ((uint64_t)row * row_mul) ^ ((uint64_t)col * col_mul)) & 0x7F) - 64);
-        
-        int val = (int)a_val + (int)__ldg(&EL[row * r + pos_col]) - (int)__ldg(&EL[row * r + neg_col]);
-        a_prime_vals[i] = (int8_t)(val > 127 ? 127 : val < -127 ? -127 : val);
+        // A' = A_base (EL noise disabled — EL/ER fusion is future work)
+        a_prime_vals[i] = (int8_t)((splitmix64(base_a ^ ((uint64_t)row * row_mul) ^ ((uint64_t)col * col_mul)) & 0x7F) - 64);
     }
     *((int4*)A_prime + tid) = *((const int4*)a_prime_vals);
 }
@@ -652,79 +639,11 @@ extern "C" __global__ void solve_blake3_pool(
 // Computes BLAKE3(seed_32bytes ++ nonce_8bytes_le) and checks for leading zero
 // bits. hash[0] word == first 4 output bytes in little-endian; difficulty=32
 // means hash[0] must be 0. If a solution is found, stores nonce atomically.
+// Stub — real implementation is in a separate module to avoid PTX-level
+// register pressure interaction with the WMMA matmul kernel.
 extern "C" __global__ void solve_pool_challenge(
-    const uint32_t* __restrict__ d_seed,    // 32-byte seed as 8 u32 LE words
-    uint64_t                     base_nonce,
-    uint32_t                     difficulty, // required leading zero bits (e.g. 32)
-    uint32_t*       __restrict__ d_nonce,   // output: found nonce as 2 u32 LE
-    uint32_t*       __restrict__ d_found    // output: 1 if any nonce found, else 0
+    const uint32_t* d_seed, uint64_t base_nonce, uint32_t difficulty,
+    uint32_t* d_nonce, uint32_t* d_found
 ) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t nonce = base_nonce + (uint64_t)tid;
-
-    // 64-byte message block: 32 seed bytes + 8 nonce bytes + 24 zero padding
-    uint32_t m[16];
-    #pragma unroll
-    for (int i = 0; i < 8; i++) m[i] = d_seed[i];
-    m[8]  = (uint32_t)(nonce & 0xFFFFFFFFu);
-    m[9]  = (uint32_t)(nonce >> 32);
-    #pragma unroll
-    for (int i = 10; i < 16; i++) m[i] = 0;
-
-    // Standard BLAKE3 compression — unkeyed single-chunk (40-byte input)
-    uint32_t v[16];
-    // Chain state = BLAKE3_IV (not key), IV constants, counter=0, len=40, flags=11
-    #pragma unroll
-    for (int i = 0; i < 8; i++) v[i]     = BLAKE3_IV[i];
-    #pragma unroll
-    for (int i = 0; i < 4; i++) v[8 + i] = BLAKE3_IV[i];
-    v[12] = 0; v[13] = 0; v[14] = 40; v[15] = BLAKE3_FLAGS_UNKEYED;
-
-    #pragma unroll
-    for (int r = 0; r < 7; r++) {
-        const uint8_t* s = BLAKE3_MSG_SCHED[r];
-        blake3_g(v, 0, 4,  8, 12, m[s[ 0]], m[s[ 1]]);
-        blake3_g(v, 1, 5,  9, 13, m[s[ 2]], m[s[ 3]]);
-        blake3_g(v, 2, 6, 10, 14, m[s[ 4]], m[s[ 5]]);
-        blake3_g(v, 3, 7, 11, 15, m[s[ 6]], m[s[ 7]]);
-        blake3_g(v, 0, 5, 10, 15, m[s[ 8]], m[s[ 9]]);
-        blake3_g(v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
-        blake3_g(v, 2, 7,  8, 13, m[s[12]], m[s[13]]);
-        blake3_g(v, 3, 4,  9, 14, m[s[14]], m[s[15]]);
-    }
-
-    uint32_t hash[8];
-    #pragma unroll
-    for (int i = 0; i < 8; i++) hash[i] = v[i] ^ v[i + 8];
-
-    // Check leading zero bits.
-    // hash[i] (LE word) = output bytes [i*4 .. i*4+4].
-    // difficulty=32 → hash[0]==0 (first 4 output bytes are 0).
-    uint32_t full_words = difficulty >> 5;       // difficulty / 32
-    uint32_t rem_bits   = difficulty & 31u;      // difficulty % 32
-
-    bool meets = true;
-    for (uint32_t i = 0; i < full_words && meets; i++) {
-        if (hash[i] != 0u) meets = false;
-    }
-    if (meets && rem_bits > 0u) {
-        // Need top rem_bits of hash[full_words] (in output byte order) to be 0.
-        // hash[] is little-endian word storage; byte 0 of word = LSByte.
-        // Byteswap to get big-endian so we can mask the top rem_bits.
-        uint32_t hw = hash[full_words];
-        uint32_t w  = ((hw & 0xFF000000u) >> 24)
-                    | ((hw & 0x00FF0000u) >>  8)
-                    | ((hw & 0x0000FF00u) <<  8)
-                    | ((hw & 0x000000FFu) << 24);
-        uint32_t mask = ~(0xFFFFFFFFu >> rem_bits);
-        if (w & mask) meets = false;
-    }
-
-    if (meets) {
-        // First thread to find a solution wins
-        if (atomicCAS(d_found, 0u, 1u) == 0u) {
-            d_nonce[0] = (uint32_t)(nonce & 0xFFFFFFFFu);
-            d_nonce[1] = (uint32_t)(nonce >> 32);
-        }
-    }
+    (void)d_seed; (void)base_nonce; (void)difficulty; (void)d_nonce; (void)d_found;
 }

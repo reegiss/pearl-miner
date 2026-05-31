@@ -150,7 +150,7 @@ fn mining_loop(
 
         let virtual_sa = *blake3::keyed_hash(&cc.kappa, &job_seed.to_le_bytes()).as_bytes();
 
-        let (found_blocks, best_nonce, best_hash, [t_kernel, t_dtoh, _]) =
+        let (found_blocks, [t_kernel, t_dtoh, _]) =
             match gpu.mine(params, job_seed, &virtual_sa) {
                 Ok(res) => res,
                 Err(e)  => { eprintln!("[gpu:{gpu_idx}] mine error: {e}"); break; }
@@ -158,11 +158,6 @@ fn mining_loop(
 
         // PoUW found blocks — submission format not yet confirmed by pool
         for _fb in found_blocks {}
-
-        // GPU solve_blake3_pool solves BLAKE3(virtual_sa||nonce), not BLAKE3(sigma||nonce).
-        // The pool checks BLAKE3(sigma||nonce), so GPU nonces are invalid for pool submission.
-        // Only the CPU solver (solve_blake3_challenge) submits valid pool shares.
-        let _ = (best_nonce, best_hash);
 
         let _ = wallet;
         t_kernel_acc += t_kernel;
